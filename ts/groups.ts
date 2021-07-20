@@ -12,6 +12,7 @@ import {
 } from 'lodash';
 import { ClientZkGroupCipher } from 'zkgroup';
 import { v4 as getGuid } from 'uuid';
+import LRU from 'lru-cache';
 import {
   getCredentialsForToday,
   GROUP_CREDENTIALS_KEY,
@@ -20,7 +21,10 @@ import {
 import { isStorageWriteFeatureEnabled } from './storage/isFeatureEnabled';
 import dataInterface from './sql/Client';
 import { toWebSafeBase64, fromWebSafeBase64 } from './util/webSafeBase64';
-import { assert } from './util/assert';
+import { assert, strictAssert } from './util/assert';
+import { isMoreRecentThan } from './util/timestamp';
+import { normalizeUuid } from './util/normalizeUuid';
+import { dropNull } from './util/dropNull';
 import {
   ConversationAttributesType,
   GroupV2MemberType,
@@ -45,133 +49,140 @@ import {
   getClientZkProfileOperations,
 } from './util/zkgroup';
 import {
-  arrayBufferToBase64,
-  arrayBufferToHex,
-  base64ToArrayBuffer,
   computeHash,
   deriveMasterKeyFromGroupV1,
   fromEncodedBinaryToArrayBuffer,
   getRandomBytes,
+  typedArrayToArrayBuffer,
 } from './Crypto';
-import {
-  AccessRequiredEnum,
-  GroupAttributeBlobClass,
-  GroupChangeClass,
-  GroupChangesClass,
-  GroupClass,
-  GroupJoinInfoClass,
-  MemberClass,
-  MemberPendingAdminApprovalClass,
-  MemberPendingProfileKeyClass,
-  ProtoBigNumberType,
-  ProtoBinaryType,
-} from './textsecure.d';
 import {
   GroupCredentialsType,
   GroupLogResponseType,
 } from './textsecure/WebAPI';
-import MessageSender, { CallbackResultType } from './textsecure/SendMessage';
+import MessageSender from './textsecure/SendMessage';
+import { CallbackResultType } from './textsecure/Types.d';
 import { CURRENT_SCHEMA_VERSION as MAX_MESSAGE_SCHEMA } from '../js/modules/types/message';
 import { ConversationModel } from './models/conversations';
 import { getGroupSizeHardLimit } from './groups/limits';
+import { ourProfileKeyService } from './services/ourProfileKey';
+import {
+  isGroupV1 as getIsGroupV1,
+  isGroupV2 as getIsGroupV2,
+  isMe,
+} from './util/whatTypeOfConversation';
+import { handleMessageSend, SendTypesType } from './util/handleMessageSend';
+import { getSendOptions } from './util/getSendOptions';
+import * as Bytes from './Bytes';
+import { SignalService as Proto } from './protobuf';
+import AccessRequiredEnum = Proto.AccessControl.AccessRequired;
 
 export { joinViaLink } from './groups/joinViaLink';
 
-export type GroupV2AccessCreateChangeType = {
+type GroupV2AccessCreateChangeType = {
   type: 'create';
 };
-export type GroupV2AccessAttributesChangeType = {
+type GroupV2AccessAttributesChangeType = {
   type: 'access-attributes';
   newPrivilege: number;
 };
-export type GroupV2AccessMembersChangeType = {
+type GroupV2AccessMembersChangeType = {
   type: 'access-members';
   newPrivilege: number;
 };
-export type GroupV2AccessInviteLinkChangeType = {
+type GroupV2AccessInviteLinkChangeType = {
   type: 'access-invite-link';
   newPrivilege: number;
 };
-export type GroupV2AvatarChangeType = {
+type GroupV2AnnouncementsOnlyChangeType = {
+  type: 'announcements-only';
+  announcementsOnly: boolean;
+};
+type GroupV2AvatarChangeType = {
   type: 'avatar';
   removed: boolean;
 };
-export type GroupV2TitleChangeType = {
+type GroupV2TitleChangeType = {
   type: 'title';
   // Allow for null, because the title could be removed entirely
   newTitle?: string;
 };
-export type GroupV2GroupLinkAddChangeType = {
+type GroupV2GroupLinkAddChangeType = {
   type: 'group-link-add';
   privilege: number;
 };
-export type GroupV2GroupLinkResetChangeType = {
+type GroupV2GroupLinkResetChangeType = {
   type: 'group-link-reset';
 };
-export type GroupV2GroupLinkRemoveChangeType = {
+type GroupV2GroupLinkRemoveChangeType = {
   type: 'group-link-remove';
 };
 
 // No disappearing messages timer change type - message.expirationTimerUpdate used instead
 
-export type GroupV2MemberAddChangeType = {
+type GroupV2MemberAddChangeType = {
   type: 'member-add';
   conversationId: string;
 };
-export type GroupV2MemberAddFromInviteChangeType = {
+type GroupV2MemberAddFromInviteChangeType = {
   type: 'member-add-from-invite';
   conversationId: string;
   inviter?: string;
 };
-export type GroupV2MemberAddFromLinkChangeType = {
+type GroupV2MemberAddFromLinkChangeType = {
   type: 'member-add-from-link';
   conversationId: string;
 };
-export type GroupV2MemberAddFromAdminApprovalChangeType = {
+type GroupV2MemberAddFromAdminApprovalChangeType = {
   type: 'member-add-from-admin-approval';
   conversationId: string;
 };
-export type GroupV2MemberPrivilegeChangeType = {
+type GroupV2MemberPrivilegeChangeType = {
   type: 'member-privilege';
   conversationId: string;
   newPrivilege: number;
 };
-export type GroupV2MemberRemoveChangeType = {
+type GroupV2MemberRemoveChangeType = {
   type: 'member-remove';
   conversationId: string;
 };
 
-export type GroupV2PendingAddOneChangeType = {
+type GroupV2PendingAddOneChangeType = {
   type: 'pending-add-one';
   conversationId: string;
 };
-export type GroupV2PendingAddManyChangeType = {
+type GroupV2PendingAddManyChangeType = {
   type: 'pending-add-many';
   count: number;
 };
 // Note: pending-remove is only used if user didn't also join the group at the same time
-export type GroupV2PendingRemoveOneChangeType = {
+type GroupV2PendingRemoveOneChangeType = {
   type: 'pending-remove-one';
   conversationId: string;
   inviter?: string;
 };
 // Note: pending-remove is only used if user didn't also join the group at the same time
-export type GroupV2PendingRemoveManyChangeType = {
+type GroupV2PendingRemoveManyChangeType = {
   type: 'pending-remove-many';
   count: number;
   inviter?: string;
 };
 
-export type GroupV2AdminApprovalAddOneChangeType = {
+type GroupV2AdminApprovalAddOneChangeType = {
   type: 'admin-approval-add-one';
   conversationId: string;
 };
 // Note: admin-approval-remove-one is only used if user didn't also join the group at
 //   the same time
-export type GroupV2AdminApprovalRemoveOneChangeType = {
+type GroupV2AdminApprovalRemoveOneChangeType = {
   type: 'admin-approval-remove-one';
   conversationId: string;
   inviter?: string;
+};
+export type GroupV2DescriptionChangeType = {
+  type: 'description';
+  removed?: boolean;
+  // Adding this field; cannot remove previous field for backwards compatibility
+  description?: string;
 };
 
 export type GroupV2ChangeDetailType =
@@ -181,10 +192,12 @@ export type GroupV2ChangeDetailType =
   | GroupV2AccessMembersChangeType
   | GroupV2AdminApprovalAddOneChangeType
   | GroupV2AdminApprovalRemoveOneChangeType
+  | GroupV2AnnouncementsOnlyChangeType
   | GroupV2AvatarChangeType
+  | GroupV2DescriptionChangeType
   | GroupV2GroupLinkAddChangeType
-  | GroupV2GroupLinkResetChangeType
   | GroupV2GroupLinkRemoveChangeType
+  | GroupV2GroupLinkResetChangeType
   | GroupV2MemberAddChangeType
   | GroupV2MemberAddFromAdminApprovalChangeType
   | GroupV2MemberAddFromInviteChangeType
@@ -201,6 +214,21 @@ export type GroupV2ChangeType = {
   from?: string;
   details: Array<GroupV2ChangeDetailType>;
 };
+
+export type GroupFields = {
+  readonly id: Uint8Array;
+  readonly secretParams: Uint8Array;
+  readonly publicParams: Uint8Array;
+};
+
+// TODO: remove once we move away from ArrayBuffers
+const FIXMEU8 = Uint8Array;
+
+const MAX_CACHED_GROUP_FIELDS = 100;
+
+const groupFieldsCache = new LRU<string, GroupFields>({
+  max: MAX_CACHED_GROUP_FIELDS,
+});
 
 const { updateConversation } = dataInterface;
 
@@ -234,12 +262,13 @@ type UploadedAvatarType = {
 
 export const MASTER_KEY_LENGTH = 32;
 const GROUP_TITLE_MAX_ENCRYPTED_BYTES = 1024;
+const GROUP_DESC_MAX_ENCRYPTED_BYTES = 8192;
 export const ID_V1_LENGTH = 16;
 export const ID_LENGTH = 32;
 const TEMPORAL_AUTH_REJECTED_CODE = 401;
 const GROUP_ACCESS_DENIED_CODE = 403;
 const GROUP_NONEXISTENT_CODE = 404;
-const SUPPORTED_CHANGE_EPOCH = 1;
+const SUPPORTED_CHANGE_EPOCH = 2;
 export const LINK_VERSION_ERROR = 'LINK_VERSION_ERROR';
 const GROUP_INVITE_LINK_PASSWORD_LENGTH = 16;
 
@@ -254,15 +283,15 @@ export function generateGroupInviteLinkPassword(): ArrayBuffer {
 export async function getPreJoinGroupInfo(
   inviteLinkPasswordBase64: string,
   masterKeyBase64: string
-): Promise<GroupJoinInfoClass> {
+): Promise<Proto.GroupJoinInfo> {
   const data = window.Signal.Groups.deriveGroupFields(
-    base64ToArrayBuffer(masterKeyBase64)
+    Bytes.fromBase64(masterKeyBase64)
   );
 
   return makeRequestWithTemporalRetry({
     logId: `groupv2(${data.id})`,
-    publicParams: arrayBufferToBase64(data.publicParams),
-    secretParams: arrayBufferToBase64(data.secretParams),
+    publicParams: Bytes.toBase64(data.publicParams),
+    secretParams: Bytes.toBase64(data.secretParams),
     request: (sender, options) =>
       sender.getGroupFromLink(inviteLinkPasswordBase64, options),
   });
@@ -271,17 +300,14 @@ export async function getPreJoinGroupInfo(
 export function buildGroupLink(conversation: ConversationModel): string {
   const { masterKey, groupInviteLinkPassword } = conversation.attributes;
 
-  const subProto = new window.textsecure.protobuf.GroupInviteLink.GroupInviteLinkContentsV1();
-  subProto.groupMasterKey = window.Signal.Crypto.base64ToArrayBuffer(masterKey);
-  subProto.inviteLinkPassword = window.Signal.Crypto.base64ToArrayBuffer(
-    groupInviteLinkPassword
-  );
+  const bytes = Proto.GroupInviteLink.encode({
+    v1Contents: {
+      groupMasterKey: Bytes.fromBase64(masterKey),
+      inviteLinkPassword: Bytes.fromBase64(groupInviteLinkPassword),
+    },
+  }).finish();
 
-  const proto = new window.textsecure.protobuf.GroupInviteLink();
-  proto.v1Contents = subProto;
-
-  const bytes = proto.toArrayBuffer();
-  const hash = toWebSafeBase64(window.Signal.Crypto.arrayBufferToBase64(bytes));
+  const hash = toWebSafeBase64(Bytes.toBase64(bytes));
 
   return `https://signal.group/#${hash}`;
 }
@@ -290,11 +316,9 @@ export function parseGroupLink(
   hash: string
 ): { masterKey: string; inviteLinkPassword: string } {
   const base64 = fromWebSafeBase64(hash);
-  const buffer = base64ToArrayBuffer(base64);
+  const buffer = Bytes.fromBase64(base64);
 
-  const inviteLinkProto = window.textsecure.protobuf.GroupInviteLink.decode(
-    buffer
-  );
+  const inviteLinkProto = Proto.GroupInviteLink.decode(buffer);
   if (
     inviteLinkProto.contents !== 'v1Contents' ||
     !inviteLinkProto.v1Contents
@@ -306,22 +330,23 @@ export function parseGroupLink(
     throw error;
   }
 
-  if (!hasData(inviteLinkProto.v1Contents.groupMasterKey)) {
+  const {
+    groupMasterKey: groupMasterKeyRaw,
+    inviteLinkPassword: inviteLinkPasswordRaw,
+  } = inviteLinkProto.v1Contents;
+
+  if (!groupMasterKeyRaw || !groupMasterKeyRaw.length) {
     throw new Error('v1Contents.groupMasterKey had no data!');
   }
-  if (!hasData(inviteLinkProto.v1Contents.inviteLinkPassword)) {
+  if (!inviteLinkPasswordRaw || !inviteLinkPasswordRaw.length) {
     throw new Error('v1Contents.inviteLinkPassword had no data!');
   }
 
-  const masterKey: string = inviteLinkProto.v1Contents.groupMasterKey.toString(
-    'base64'
-  );
+  const masterKey = Bytes.toBase64(groupMasterKeyRaw);
   if (masterKey.length !== 44) {
     throw new Error(`masterKey had unexpected length ${masterKey.length}`);
   }
-  const inviteLinkPassword: string = inviteLinkProto.v1Contents.inviteLinkPassword.toString(
-    'base64'
-  );
+  const inviteLinkPassword = Bytes.toBase64(inviteLinkPasswordRaw);
   if (inviteLinkPassword.length === 0) {
     throw new Error(
       `inviteLinkPassword had unexpected length ${inviteLinkPassword.length}`
@@ -354,9 +379,9 @@ async function uploadAvatar(
 
     const hash = await computeHash(data);
 
-    const blob = new window.textsecure.protobuf.GroupAttributeBlob();
-    blob.avatar = data;
-    const blobPlaintext = blob.toArrayBuffer();
+    const blobPlaintext = Proto.GroupAttributeBlob.encode({
+      avatar: new FIXMEU8(data),
+    }).finish();
     const ciphertext = encryptGroupBlob(clientZkGroupCipher, blobPlaintext);
 
     const key = await makeRequestWithTemporalRetry({
@@ -384,15 +409,34 @@ async function uploadAvatar(
 function buildGroupTitleBuffer(
   clientZkGroupCipher: ClientZkGroupCipher,
   title: string
-): ArrayBuffer {
-  const titleBlob = new window.textsecure.protobuf.GroupAttributeBlob();
-  titleBlob.title = title;
-  const titleBlobPlaintext = titleBlob.toArrayBuffer();
+): Uint8Array {
+  const titleBlobPlaintext = Proto.GroupAttributeBlob.encode({
+    title,
+  }).finish();
 
   const result = encryptGroupBlob(clientZkGroupCipher, titleBlobPlaintext);
 
   if (result.byteLength > GROUP_TITLE_MAX_ENCRYPTED_BYTES) {
     throw new Error('buildGroupTitleBuffer: encrypted group title is too long');
+  }
+
+  return result;
+}
+
+function buildGroupDescriptionBuffer(
+  clientZkGroupCipher: ClientZkGroupCipher,
+  description: string
+): Uint8Array {
+  const attrsBlobPlaintext = Proto.GroupAttributeBlob.encode({
+    descriptionText: description,
+  }).finish();
+
+  const result = encryptGroupBlob(clientZkGroupCipher, attrsBlobPlaintext);
+
+  if (result.byteLength > GROUP_DESC_MAX_ENCRYPTED_BYTES) {
+    throw new Error(
+      'buildGroupDescriptionBuffer: encrypted group title is too long'
+    );
   }
 
   return result;
@@ -413,9 +457,9 @@ function buildGroupProto(
   > & {
     avatarUrl?: string;
   }
-): GroupClass {
-  const MEMBER_ROLE_ENUM = window.textsecure.protobuf.Member.Role;
-  const ACCESS_ENUM = window.textsecure.protobuf.AccessControl.AccessRequired;
+): Proto.Group {
+  const MEMBER_ROLE_ENUM = Proto.Member.Role;
+  const ACCESS_ENUM = Proto.AccessControl.AccessRequired;
   const logId = `groupv2(${attributes.id})`;
 
   const { publicParams, secretParams } = attributes;
@@ -436,9 +480,9 @@ function buildGroupProto(
   const clientZkProfileCipher = getClientZkProfileOperations(
     serverPublicParamsBase64
   );
-  const proto = new window.textsecure.protobuf.Group();
+  const proto = new Proto.Group();
 
-  proto.publicKey = base64ToArrayBuffer(publicParams);
+  proto.publicKey = Bytes.fromBase64(publicParams);
   proto.version = attributes.revision || 0;
 
   if (attributes.name) {
@@ -450,16 +494,16 @@ function buildGroupProto(
   }
 
   if (attributes.expireTimer) {
-    const timerBlob = new window.textsecure.protobuf.GroupAttributeBlob();
-    timerBlob.disappearingMessagesDuration = attributes.expireTimer;
-    const timerBlobPlaintext = timerBlob.toArrayBuffer();
+    const timerBlobPlaintext = Proto.GroupAttributeBlob.encode({
+      disappearingMessagesDuration: attributes.expireTimer,
+    }).finish();
     proto.disappearingMessagesTimer = encryptGroupBlob(
       clientZkGroupCipher,
       timerBlobPlaintext
     );
   }
 
-  const accessControl = new window.textsecure.protobuf.AccessControl();
+  const accessControl = new Proto.AccessControl();
   if (attributes.accessControl) {
     accessControl.attributes =
       attributes.accessControl.attributes || ACCESS_ENUM.MEMBER;
@@ -472,7 +516,7 @@ function buildGroupProto(
   proto.accessControl = accessControl;
 
   proto.members = (attributes.membersV2 || []).map(item => {
-    const member = new window.textsecure.protobuf.Member();
+    const member = new Proto.Member();
 
     const conversation = window.ConversationController.get(item.conversationId);
     if (!conversation) {
@@ -520,8 +564,8 @@ function buildGroupProto(
 
   proto.membersPendingProfileKey = (attributes.pendingMembersV2 || []).map(
     item => {
-      const pendingMember = new window.textsecure.protobuf.MemberPendingProfileKey();
-      const member = new window.textsecure.protobuf.Member();
+      const pendingMember = new Proto.MemberPendingProfileKey();
+      const member = new Proto.Member();
 
       const conversation = window.ConversationController.get(
         item.conversationId
@@ -556,8 +600,8 @@ export async function buildAddMembersChange(
     'id' | 'publicParams' | 'revision' | 'secretParams'
   >,
   conversationIds: ReadonlyArray<string>
-): Promise<undefined | GroupChangeClass.Actions> {
-  const MEMBER_ROLE_ENUM = window.textsecure.protobuf.Member.Role;
+): Promise<undefined | Proto.GroupChange.Actions> {
+  const MEMBER_ROLE_ENUM = Proto.Member.Role;
 
   const { id, publicParams, revision, secretParams } = conversation;
 
@@ -593,8 +637,8 @@ export async function buildAddMembersChange(
 
   const now = Date.now();
 
-  const addMembers: Array<GroupChangeClass.Actions.AddMemberAction> = [];
-  const addPendingMembers: Array<GroupChangeClass.Actions.AddMemberPendingProfileKeyAction> = [];
+  const addMembers: Array<Proto.GroupChange.Actions.AddMemberAction> = [];
+  const addPendingMembers: Array<Proto.GroupChange.Actions.AddMemberPendingProfileKeyAction> = [];
 
   await Promise.all(
     conversationIds.map(async conversationId => {
@@ -641,7 +685,7 @@ export async function buildAddMembersChange(
         return;
       }
 
-      const member = new window.textsecure.protobuf.Member();
+      const member = new Proto.Member();
       member.userId = encryptUuid(clientZkGroupCipher, uuid);
       member.role = MEMBER_ROLE_ENUM.DEFAULT;
       member.joinedAtVersion = newGroupVersion;
@@ -656,18 +700,18 @@ export async function buildAddMembersChange(
           secretParams
         );
 
-        const addMemberAction = new window.textsecure.protobuf.GroupChange.Actions.AddMemberAction();
+        const addMemberAction = new Proto.GroupChange.Actions.AddMemberAction();
         addMemberAction.added = member;
         addMemberAction.joinFromInviteLink = false;
 
         addMembers.push(addMemberAction);
       } else {
-        const memberPendingProfileKey = new window.textsecure.protobuf.MemberPendingProfileKey();
+        const memberPendingProfileKey = new Proto.MemberPendingProfileKey();
         memberPendingProfileKey.member = member;
         memberPendingProfileKey.addedByUserId = ourUuidCipherTextBuffer;
         memberPendingProfileKey.timestamp = now;
 
-        const addPendingMemberAction = new window.textsecure.protobuf.GroupChange.Actions.AddMemberPendingProfileKeyAction();
+        const addPendingMemberAction = new Proto.GroupChange.Actions.AddMemberPendingProfileKeyAction();
         addPendingMemberAction.added = memberPendingProfileKey;
 
         addPendingMembers.push(addPendingMemberAction);
@@ -675,7 +719,7 @@ export async function buildAddMembersChange(
     })
   );
 
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+  const actions = new Proto.GroupChange.Actions();
   if (!addMembers.length && !addPendingMembers.length) {
     // This shouldn't happen. When these actions are passed to `modifyGroupV2`, a warning
     //   will be logged.
@@ -699,9 +743,10 @@ export async function buildUpdateAttributesChange(
   >,
   attributes: Readonly<{
     avatar?: undefined | ArrayBuffer;
+    description?: string;
     title?: string;
   }>
-): Promise<undefined | GroupChangeClass.Actions> {
+): Promise<undefined | Proto.GroupChange.Actions> {
   const { publicParams, secretParams, revision, id } = conversation;
 
   const logId = `groupv2(${id})`;
@@ -717,7 +762,7 @@ export async function buildUpdateAttributesChange(
     );
   }
 
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+  const actions = new Proto.GroupChange.Actions();
 
   let hasChangedSomething = false;
 
@@ -731,7 +776,7 @@ export async function buildUpdateAttributesChange(
   if ('avatar' in attributes) {
     hasChangedSomething = true;
 
-    actions.modifyAvatar = new window.textsecure.protobuf.GroupChange.Actions.ModifyAvatarAction();
+    actions.modifyAvatar = new Proto.GroupChange.Actions.ModifyAvatarAction();
     const { avatar } = attributes;
     if (avatar) {
       const uploadedAvatar = await uploadAvatar({
@@ -750,10 +795,21 @@ export async function buildUpdateAttributesChange(
   if (title) {
     hasChangedSomething = true;
 
-    actions.modifyTitle = new window.textsecure.protobuf.GroupChange.Actions.ModifyTitleAction();
+    actions.modifyTitle = new Proto.GroupChange.Actions.ModifyTitleAction();
     actions.modifyTitle.title = buildGroupTitleBuffer(
       clientZkGroupCipher,
       title
+    );
+  }
+
+  const { description } = attributes;
+  if (typeof description === 'string') {
+    hasChangedSomething = true;
+
+    actions.modifyDescription = new Proto.GroupChange.Actions.ModifyDescriptionAction();
+    actions.modifyDescription.descriptionBytes = buildGroupDescriptionBuffer(
+      clientZkGroupCipher,
+      description
     );
   }
 
@@ -772,12 +828,12 @@ export function buildDisappearingMessagesTimerChange({
   expireTimer,
   group,
 }: {
-  expireTimer?: number;
+  expireTimer: number;
   group: ConversationAttributesType;
-}): GroupChangeClass.Actions {
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+}): Proto.GroupChange.Actions {
+  const actions = new Proto.GroupChange.Actions();
 
-  const blob = new window.textsecure.protobuf.GroupAttributeBlob();
+  const blob = new Proto.GroupAttributeBlob();
   blob.disappearingMessagesDuration = expireTimer;
 
   if (!group.secretParams) {
@@ -787,10 +843,10 @@ export function buildDisappearingMessagesTimerChange({
   }
   const clientZkGroupCipher = getClientZkGroupCipher(group.secretParams);
 
-  const blobPlaintext = blob.toArrayBuffer();
+  const blobPlaintext = Proto.GroupAttributeBlob.encode(blob).finish();
   const blobCipherText = encryptGroupBlob(clientZkGroupCipher, blobPlaintext);
 
-  const timerAction = new window.textsecure.protobuf.GroupChange.Actions.ModifyDisappearingMessagesTimerAction();
+  const timerAction = new Proto.GroupChange.Actions.ModifyDisappearingMessagesTimerAction();
   timerAction.timer = blobCipherText;
 
   actions.version = (group.revision || 0) + 1;
@@ -802,13 +858,13 @@ export function buildDisappearingMessagesTimerChange({
 export function buildInviteLinkPasswordChange(
   group: ConversationAttributesType,
   inviteLinkPassword: string
-): GroupChangeClass.Actions {
-  const inviteLinkPasswordAction = new window.textsecure.protobuf.GroupChange.Actions.ModifyInviteLinkPasswordAction();
-  inviteLinkPasswordAction.inviteLinkPassword = base64ToArrayBuffer(
+): Proto.GroupChange.Actions {
+  const inviteLinkPasswordAction = new Proto.GroupChange.Actions.ModifyInviteLinkPasswordAction();
+  inviteLinkPasswordAction.inviteLinkPassword = Bytes.fromBase64(
     inviteLinkPassword
   );
 
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+  const actions = new Proto.GroupChange.Actions();
   actions.version = (group.revision || 0) + 1;
   actions.modifyInviteLinkPassword = inviteLinkPasswordAction;
 
@@ -819,16 +875,16 @@ export function buildNewGroupLinkChange(
   group: ConversationAttributesType,
   inviteLinkPassword: string,
   addFromInviteLinkAccess: AccessRequiredEnum
-): GroupChangeClass.Actions {
-  const accessControlAction = new window.textsecure.protobuf.GroupChange.Actions.ModifyAddFromInviteLinkAccessControlAction();
+): Proto.GroupChange.Actions {
+  const accessControlAction = new Proto.GroupChange.Actions.ModifyAddFromInviteLinkAccessControlAction();
   accessControlAction.addFromInviteLinkAccess = addFromInviteLinkAccess;
 
-  const inviteLinkPasswordAction = new window.textsecure.protobuf.GroupChange.Actions.ModifyInviteLinkPasswordAction();
-  inviteLinkPasswordAction.inviteLinkPassword = base64ToArrayBuffer(
+  const inviteLinkPasswordAction = new Proto.GroupChange.Actions.ModifyInviteLinkPasswordAction();
+  inviteLinkPasswordAction.inviteLinkPassword = Bytes.fromBase64(
     inviteLinkPassword
   );
 
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+  const actions = new Proto.GroupChange.Actions();
   actions.version = (group.revision || 0) + 1;
   actions.modifyAddFromInviteLinkAccess = accessControlAction;
   actions.modifyInviteLinkPassword = inviteLinkPasswordAction;
@@ -839,13 +895,27 @@ export function buildNewGroupLinkChange(
 export function buildAccessControlAddFromInviteLinkChange(
   group: ConversationAttributesType,
   value: AccessRequiredEnum
-): GroupChangeClass.Actions {
-  const accessControlAction = new window.textsecure.protobuf.GroupChange.Actions.ModifyAddFromInviteLinkAccessControlAction();
+): Proto.GroupChange.Actions {
+  const accessControlAction = new Proto.GroupChange.Actions.ModifyAddFromInviteLinkAccessControlAction();
   accessControlAction.addFromInviteLinkAccess = value;
 
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+  const actions = new Proto.GroupChange.Actions();
   actions.version = (group.revision || 0) + 1;
   actions.modifyAddFromInviteLinkAccess = accessControlAction;
+
+  return actions;
+}
+
+export function buildAnnouncementsOnlyChange(
+  group: ConversationAttributesType,
+  value: boolean
+): Proto.GroupChange.Actions {
+  const action = new Proto.GroupChange.Actions.ModifyAnnouncementsOnlyAction();
+  action.announcementsOnly = value;
+
+  const actions = new Proto.GroupChange.Actions();
+  actions.version = (group.revision || 0) + 1;
+  actions.modifyAnnouncementsOnly = action;
 
   return actions;
 }
@@ -853,11 +923,11 @@ export function buildAccessControlAddFromInviteLinkChange(
 export function buildAccessControlAttributesChange(
   group: ConversationAttributesType,
   value: AccessRequiredEnum
-): GroupChangeClass.Actions {
-  const accessControlAction = new window.textsecure.protobuf.GroupChange.Actions.ModifyAttributesAccessControlAction();
+): Proto.GroupChange.Actions {
+  const accessControlAction = new Proto.GroupChange.Actions.ModifyAttributesAccessControlAction();
   accessControlAction.attributesAccess = value;
 
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+  const actions = new Proto.GroupChange.Actions();
   actions.version = (group.revision || 0) + 1;
   actions.modifyAttributesAccess = accessControlAction;
 
@@ -867,11 +937,11 @@ export function buildAccessControlAttributesChange(
 export function buildAccessControlMembersChange(
   group: ConversationAttributesType,
   value: AccessRequiredEnum
-): GroupChangeClass.Actions {
-  const accessControlAction = new window.textsecure.protobuf.GroupChange.Actions.ModifyMembersAccessControlAction();
+): Proto.GroupChange.Actions {
+  const accessControlAction = new Proto.GroupChange.Actions.ModifyMembersAccessControlAction();
   accessControlAction.membersAccess = value;
 
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+  const actions = new Proto.GroupChange.Actions();
   actions.version = (group.revision || 0) + 1;
   actions.modifyMemberAccess = accessControlAction;
 
@@ -885,8 +955,8 @@ export function buildDeletePendingAdminApprovalMemberChange({
 }: {
   group: ConversationAttributesType;
   uuid: string;
-}): GroupChangeClass.Actions {
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+}): Proto.GroupChange.Actions {
+  const actions = new Proto.GroupChange.Actions();
 
   if (!group.secretParams) {
     throw new Error(
@@ -896,7 +966,7 @@ export function buildDeletePendingAdminApprovalMemberChange({
   const clientZkGroupCipher = getClientZkGroupCipher(group.secretParams);
   const uuidCipherTextBuffer = encryptUuid(clientZkGroupCipher, uuid);
 
-  const deleteMemberPendingAdminApproval = new window.textsecure.protobuf.GroupChange.Actions.DeleteMemberPendingAdminApprovalAction();
+  const deleteMemberPendingAdminApproval = new Proto.GroupChange.Actions.DeleteMemberPendingAdminApprovalAction();
   deleteMemberPendingAdminApproval.deletedUserId = uuidCipherTextBuffer;
 
   actions.version = (group.revision || 0) + 1;
@@ -915,8 +985,8 @@ export function buildAddPendingAdminApprovalMemberChange({
   group: ConversationAttributesType;
   profileKeyCredentialBase64: string;
   serverPublicParamsBase64: string;
-}): GroupChangeClass.Actions {
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+}): Proto.GroupChange.Actions {
+  const actions = new Proto.GroupChange.Actions();
 
   if (!group.secretParams) {
     throw new Error(
@@ -927,14 +997,14 @@ export function buildAddPendingAdminApprovalMemberChange({
     serverPublicParamsBase64
   );
 
-  const addMemberPendingAdminApproval = new window.textsecure.protobuf.GroupChange.Actions.AddMemberPendingAdminApprovalAction();
+  const addMemberPendingAdminApproval = new Proto.GroupChange.Actions.AddMemberPendingAdminApprovalAction();
   const presentation = createProfileKeyCredentialPresentation(
     clientZkProfileCipher,
     profileKeyCredentialBase64,
     group.secretParams
   );
 
-  const added = new window.textsecure.protobuf.MemberPendingAdminApproval();
+  const added = new Proto.MemberPendingAdminApproval();
   added.presentation = presentation;
 
   addMemberPendingAdminApproval.added = added;
@@ -954,10 +1024,10 @@ export function buildAddMember({
   profileKeyCredentialBase64: string;
   serverPublicParamsBase64: string;
   joinFromInviteLink?: boolean;
-}): GroupChangeClass.Actions {
-  const MEMBER_ROLE_ENUM = window.textsecure.protobuf.Member.Role;
+}): Proto.GroupChange.Actions {
+  const MEMBER_ROLE_ENUM = Proto.Member.Role;
 
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+  const actions = new Proto.GroupChange.Actions();
 
   if (!group.secretParams) {
     throw new Error('buildAddMember: group was missing secretParams!');
@@ -966,14 +1036,14 @@ export function buildAddMember({
     serverPublicParamsBase64
   );
 
-  const addMember = new window.textsecure.protobuf.GroupChange.Actions.AddMemberAction();
+  const addMember = new Proto.GroupChange.Actions.AddMemberAction();
   const presentation = createProfileKeyCredentialPresentation(
     clientZkProfileCipher,
     profileKeyCredentialBase64,
     group.secretParams
   );
 
-  const added = new window.textsecure.protobuf.Member();
+  const added = new Proto.Member();
   added.presentation = presentation;
   added.role = MEMBER_ROLE_ENUM.DEFAULT;
 
@@ -991,8 +1061,8 @@ export function buildDeletePendingMemberChange({
 }: {
   uuids: Array<string>;
   group: ConversationAttributesType;
-}): GroupChangeClass.Actions {
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+}): Proto.GroupChange.Actions {
+  const actions = new Proto.GroupChange.Actions();
 
   if (!group.secretParams) {
     throw new Error(
@@ -1003,7 +1073,7 @@ export function buildDeletePendingMemberChange({
 
   const deletePendingMembers = uuids.map(uuid => {
     const uuidCipherTextBuffer = encryptUuid(clientZkGroupCipher, uuid);
-    const deletePendingMember = new window.textsecure.protobuf.GroupChange.Actions.DeleteMemberPendingProfileKeyAction();
+    const deletePendingMember = new Proto.GroupChange.Actions.DeleteMemberPendingProfileKeyAction();
     deletePendingMember.deletedUserId = uuidCipherTextBuffer;
     return deletePendingMember;
   });
@@ -1020,8 +1090,8 @@ export function buildDeleteMemberChange({
 }: {
   uuid: string;
   group: ConversationAttributesType;
-}): GroupChangeClass.Actions {
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+}): Proto.GroupChange.Actions {
+  const actions = new Proto.GroupChange.Actions();
 
   if (!group.secretParams) {
     throw new Error('buildDeleteMemberChange: group was missing secretParams!');
@@ -1029,7 +1099,7 @@ export function buildDeleteMemberChange({
   const clientZkGroupCipher = getClientZkGroupCipher(group.secretParams);
   const uuidCipherTextBuffer = encryptUuid(clientZkGroupCipher, uuid);
 
-  const deleteMember = new window.textsecure.protobuf.GroupChange.Actions.DeleteMemberAction();
+  const deleteMember = new Proto.GroupChange.Actions.DeleteMemberAction();
   deleteMember.deletedUserId = uuidCipherTextBuffer;
 
   actions.version = (group.revision || 0) + 1;
@@ -1046,8 +1116,8 @@ export function buildModifyMemberRoleChange({
   uuid: string;
   group: ConversationAttributesType;
   role: number;
-}): GroupChangeClass.Actions {
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+}): Proto.GroupChange.Actions {
+  const actions = new Proto.GroupChange.Actions();
 
   if (!group.secretParams) {
     throw new Error('buildMakeAdminChange: group was missing secretParams!');
@@ -1056,7 +1126,7 @@ export function buildModifyMemberRoleChange({
   const clientZkGroupCipher = getClientZkGroupCipher(group.secretParams);
   const uuidCipherTextBuffer = encryptUuid(clientZkGroupCipher, uuid);
 
-  const toggleAdmin = new window.textsecure.protobuf.GroupChange.Actions.ModifyMemberRoleAction();
+  const toggleAdmin = new Proto.GroupChange.Actions.ModifyMemberRoleAction();
   toggleAdmin.userId = uuidCipherTextBuffer;
   toggleAdmin.role = role;
 
@@ -1072,9 +1142,9 @@ export function buildPromotePendingAdminApprovalMemberChange({
 }: {
   group: ConversationAttributesType;
   uuid: string;
-}): GroupChangeClass.Actions {
-  const MEMBER_ROLE_ENUM = window.textsecure.protobuf.Member.Role;
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+}): Proto.GroupChange.Actions {
+  const MEMBER_ROLE_ENUM = Proto.Member.Role;
+  const actions = new Proto.GroupChange.Actions();
 
   if (!group.secretParams) {
     throw new Error(
@@ -1085,7 +1155,7 @@ export function buildPromotePendingAdminApprovalMemberChange({
   const clientZkGroupCipher = getClientZkGroupCipher(group.secretParams);
   const uuidCipherTextBuffer = encryptUuid(clientZkGroupCipher, uuid);
 
-  const promotePendingMember = new window.textsecure.protobuf.GroupChange.Actions.PromoteMemberPendingAdminApprovalAction();
+  const promotePendingMember = new Proto.GroupChange.Actions.PromoteMemberPendingAdminApprovalAction();
   promotePendingMember.userId = uuidCipherTextBuffer;
   promotePendingMember.role = MEMBER_ROLE_ENUM.DEFAULT;
 
@@ -1103,8 +1173,8 @@ export function buildPromoteMemberChange({
   group: ConversationAttributesType;
   profileKeyCredentialBase64: string;
   serverPublicParamsBase64: string;
-}): GroupChangeClass.Actions {
-  const actions = new window.textsecure.protobuf.GroupChange.Actions();
+}): Proto.GroupChange.Actions {
+  const actions = new Proto.GroupChange.Actions();
 
   if (!group.secretParams) {
     throw new Error(
@@ -1121,7 +1191,7 @@ export function buildPromoteMemberChange({
     group.secretParams
   );
 
-  const promotePendingMember = new window.textsecure.protobuf.GroupChange.Actions.PromoteMemberPendingProfileKeyAction();
+  const promotePendingMember = new Proto.GroupChange.Actions.PromoteMemberPendingProfileKeyAction();
   promotePendingMember.presentation = presentation;
 
   actions.version = (group.revision || 0) + 1;
@@ -1135,10 +1205,10 @@ export async function uploadGroupChange({
   group,
   inviteLinkPassword,
 }: {
-  actions: GroupChangeClass.Actions;
+  actions: Proto.GroupChange.IActions;
   group: ConversationAttributesType;
   inviteLinkPassword?: string;
-}): Promise<GroupChangeClass> {
+}): Promise<Proto.IGroupChange> {
   const logId = idForLogging(group.groupId);
 
   // Ensure we have the credentials we need before attempting GroupsV2 operations
@@ -1168,14 +1238,14 @@ export async function modifyGroupV2({
   name,
 }: {
   conversation: ConversationModel;
-  createGroupChange: () => Promise<GroupChangeClass.Actions | undefined>;
+  createGroupChange: () => Promise<Proto.GroupChange.Actions | undefined>;
   extraConversationsForSend?: Array<string>;
   inviteLinkPassword?: string;
   name: string;
 }): Promise<void> {
   const idLog = `${name}/${conversation.idForLogging()}`;
 
-  if (!conversation.isGroupV2()) {
+  if (!getIsGroupV2(conversation.attributes)) {
     throw new Error(
       `modifyGroupV2/${idLog}: Called for non-GroupV2 conversation`
     );
@@ -1196,7 +1266,7 @@ export async function modifyGroupV2({
       window.log.info(`modifyGroupV2/${idLog}: Queuing attempt ${attempt}`);
 
       // eslint-disable-next-line no-await-in-loop
-      await conversation.queueJob(async () => {
+      await conversation.queueJob('modifyGroupV2', async () => {
         window.log.info(`modifyGroupV2/${idLog}: Running attempt ${attempt}`);
 
         const actions = await createGroupChange();
@@ -1225,8 +1295,10 @@ export async function modifyGroupV2({
           group: conversation.attributes,
         });
 
-        const groupChangeBuffer = groupChange.toArrayBuffer();
-        const groupChangeBase64 = arrayBufferToBase64(groupChangeBuffer);
+        const groupChangeBuffer = Proto.GroupChange.encode(
+          groupChange
+        ).finish();
+        const groupChangeBase64 = Bytes.toBase64(groupChangeBuffer);
 
         // Apply change locally, just like we would with an incoming change. This will
         //   change conversation state and add change notifications to the timeline.
@@ -1238,25 +1310,31 @@ export async function modifyGroupV2({
 
         // Send message to notify group members (including pending members) of change
         const profileKey = conversation.get('profileSharing')
-          ? window.storage.get('profileKey')
+          ? await ourProfileKeyService.get()
           : undefined;
 
-        const sendOptions = conversation.getSendOptions();
+        const sendOptions = await getSendOptions(conversation.attributes);
         const timestamp = Date.now();
+        const { ContentHint } = Proto.UnidentifiedSenderMessage.Message;
 
-        const promise = conversation.wrapSend(
-          window.textsecure.messaging.sendMessageToGroup(
-            {
+        const promise = handleMessageSend(
+          window.Signal.Util.sendToGroup({
+            groupSendOptions: {
               groupV2: conversation.getGroupV2Info({
-                groupChange: groupChangeBuffer,
+                groupChange: typedArrayToArrayBuffer(groupChangeBuffer),
                 includePendingMembers: true,
                 extraConversationsForSend,
               }),
               timestamp,
               profileKey,
             },
-            sendOptions
-          )
+            conversation,
+            contentHint: ContentHint.RESENDABLE,
+            messageId: undefined,
+            sendOptions,
+            sendType: 'groupChange',
+          }),
+          { messageIds: [], sendType: 'groupChange' }
         );
 
         // We don't save this message; we just use it to ensure that a sync message is
@@ -1314,18 +1392,33 @@ export function idForLogging(groupId: string | undefined): string {
   return `groupv2(${groupId})`;
 }
 
-export function deriveGroupFields(
-  masterKey: ArrayBuffer
-): { id: ArrayBuffer; secretParams: ArrayBuffer; publicParams: ArrayBuffer } {
+export function deriveGroupFields(masterKey: Uint8Array): GroupFields {
+  if (masterKey.length !== MASTER_KEY_LENGTH) {
+    throw new Error(
+      `deriveGroupFields: masterKey had length ${masterKey.length}, ` +
+        `expected ${MASTER_KEY_LENGTH}`
+    );
+  }
+
+  const cacheKey = Bytes.toBase64(masterKey);
+  const cached = groupFieldsCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  window.log.info('deriveGroupFields: cache miss');
+
   const secretParams = deriveGroupSecretParams(masterKey);
   const publicParams = deriveGroupPublicParams(secretParams);
   const id = deriveGroupID(secretParams);
 
-  return {
+  const fresh = {
     id,
     secretParams,
     publicParams,
   };
+  groupFieldsCache.set(cacheKey, fresh);
+  return fresh;
 }
 
 async function makeRequestWithTemporalRetry<T>({
@@ -1413,10 +1506,12 @@ export async function fetchMembershipProof({
 export async function createGroupV2({
   name,
   avatar,
+  expireTimer,
   conversationIds,
 }: Readonly<{
   name: string;
   avatar: undefined | ArrayBuffer;
+  expireTimer: undefined | number;
   conversationIds: Array<string>;
 }>): Promise<ConversationModel> {
   // Ensure we have the credentials we need before attempting GroupsV2 operations
@@ -1428,18 +1523,18 @@ export async function createGroupV2({
     );
   }
 
-  const ACCESS_ENUM = window.textsecure.protobuf.AccessControl.AccessRequired;
-  const MEMBER_ROLE_ENUM = window.textsecure.protobuf.Member.Role;
+  const ACCESS_ENUM = Proto.AccessControl.AccessRequired;
+  const MEMBER_ROLE_ENUM = Proto.Member.Role;
 
-  const masterKeyBuffer = getRandomBytes(32);
+  const masterKeyBuffer = new FIXMEU8(getRandomBytes(32));
   const fields = deriveGroupFields(masterKeyBuffer);
 
-  const groupId = arrayBufferToBase64(fields.id);
+  const groupId = Bytes.toBase64(fields.id);
   const logId = `groupv2(${groupId})`;
 
-  const masterKey = arrayBufferToBase64(masterKeyBuffer);
-  const secretParams = arrayBufferToBase64(fields.secretParams);
-  const publicParams = arrayBufferToBase64(fields.publicParams);
+  const masterKey = Bytes.toBase64(masterKeyBuffer);
+  const secretParams = Bytes.toBase64(fields.secretParams);
+  const publicParams = Bytes.toBase64(fields.publicParams);
 
   const ourConversationId = window.ConversationController.getOurConversationIdOrThrow();
   const ourConversation = window.ConversationController.get(ourConversationId);
@@ -1594,26 +1689,37 @@ export async function createGroupV2({
     }
   );
 
-  await conversation.queueJob(() => {
+  await conversation.queueJob('storageServiceUploadJob', () => {
     window.Signal.Services.storageServiceUploadJob();
   });
 
   const timestamp = Date.now();
-  const profileKey = ourConversation.get('profileKey');
+  const profileKey = await ourProfileKeyService.get();
 
   const groupV2Info = conversation.getGroupV2Info({
     includePendingMembers: true,
   });
+  const { ContentHint } = Proto.UnidentifiedSenderMessage.Message;
+  const sendOptions = await getSendOptions(conversation.attributes);
 
   await wrapWithSyncMessageSend({
     conversation,
-    logId: `sendMessageToGroup/${logId}`,
-    send: async sender =>
-      sender.sendMessageToGroup({
-        groupV2: groupV2Info,
-        timestamp,
-        profileKey: profileKey ? base64ToArrayBuffer(profileKey) : undefined,
+    logId: `sendToGroup/${logId}`,
+    messageIds: [],
+    send: async () =>
+      window.Signal.Util.sendToGroup({
+        groupSendOptions: {
+          groupV2: groupV2Info,
+          timestamp,
+          profileKey,
+        },
+        conversation,
+        contentHint: ContentHint.RESENDABLE,
+        messageId: undefined,
+        sendOptions,
+        sendType: 'groupChange',
       }),
+    sendType: 'groupChange',
     timestamp,
   });
 
@@ -1637,6 +1743,10 @@ export async function createGroupV2({
   window.MessageController.register(model.id, model);
   conversation.trigger('newmessage', model);
 
+  if (expireTimer) {
+    await conversation.updateExpirationTimer(expireTimer);
+  }
+
   return conversation;
 }
 
@@ -1646,7 +1756,7 @@ export async function hasV1GroupBeenMigrated(
   conversation: ConversationModel
 ): Promise<boolean> {
   const logId = conversation.idForLogging();
-  const isGroupV1 = conversation.isGroupV1();
+  const isGroupV1 = getIsGroupV1(conversation.attributes);
   if (!isGroupV1) {
     window.log.warn(
       `checkForGV2Existence/${logId}: Called for non-GroupV1 conversation!`
@@ -1663,14 +1773,16 @@ export async function hasV1GroupBeenMigrated(
   }
 
   const idBuffer = fromEncodedBinaryToArrayBuffer(groupId);
-  const masterKeyBuffer = await deriveMasterKeyFromGroupV1(idBuffer);
+  const masterKeyBuffer = new FIXMEU8(
+    await deriveMasterKeyFromGroupV1(idBuffer)
+  );
   const fields = deriveGroupFields(masterKeyBuffer);
 
   try {
     await makeRequestWithTemporalRetry({
       logId: `getGroup/${logId}`,
-      publicParams: arrayBufferToBase64(fields.publicParams),
-      secretParams: arrayBufferToBase64(fields.secretParams),
+      publicParams: Bytes.toBase64(fields.publicParams),
+      secretParams: Bytes.toBase64(fields.secretParams),
       request: (sender, options) => sender.getGroup(options),
     });
     return true;
@@ -1683,7 +1795,7 @@ export async function hasV1GroupBeenMigrated(
 export async function maybeDeriveGroupV2Id(
   conversation: ConversationModel
 ): Promise<boolean> {
-  const isGroupV1 = conversation.isGroupV1();
+  const isGroupV1 = getIsGroupV1(conversation.attributes);
   const groupV1Id = conversation.get('groupId');
   const derived = conversation.get('derivedGroupV2Id');
 
@@ -1692,9 +1804,11 @@ export async function maybeDeriveGroupV2Id(
   }
 
   const v1IdBuffer = fromEncodedBinaryToArrayBuffer(groupV1Id);
-  const masterKeyBuffer = await deriveMasterKeyFromGroupV1(v1IdBuffer);
+  const masterKeyBuffer = new FIXMEU8(
+    await deriveMasterKeyFromGroupV1(v1IdBuffer)
+  );
   const fields = deriveGroupFields(masterKeyBuffer);
-  const derivedGroupV2Id = arrayBufferToBase64(fields.id);
+  const derivedGroupV2Id = Bytes.toBase64(fields.id);
 
   conversation.set({
     derivedGroupV2Id,
@@ -1714,7 +1828,7 @@ type MigratePropsType = {
 export async function isGroupEligibleToMigrate(
   conversation: ConversationModel
 ): Promise<boolean> {
-  if (!conversation.isGroupV1()) {
+  if (!getIsGroupV1(conversation.attributes)) {
     return false;
   }
 
@@ -1752,7 +1866,7 @@ export async function getGroupMigrationMembers(
   previousGroupV1Members: Array<string>;
 }> {
   const logId = conversation.idForLogging();
-  const MEMBER_ROLE_ENUM = window.textsecure.protobuf.Member.Role;
+  const MEMBER_ROLE_ENUM = Proto.Member.Role;
 
   const ourConversationId = window.ConversationController.getOurConversationId();
   if (!ourConversationId) {
@@ -1777,7 +1891,7 @@ export async function getGroupMigrationMembers(
             `getGroupMigrationMembers/${logId}: membersV2 - missing local contact for ${e164}, skipping.`
           );
         }
-        if (!contact.isMe() && window.GV2_MIGRATION_DISABLE_ADD) {
+        if (!isMe(contact.attributes) && window.GV2_MIGRATION_DISABLE_ADD) {
           window.log.warn(
             `getGroupMigrationMembers/${logId}: membersV2 - skipping ${e164} due to GV2_MIGRATION_DISABLE_ADD flag`
           );
@@ -1864,7 +1978,7 @@ export async function getGroupMigrationMembers(
         return null;
       }
 
-      if (!contact.isMe() && window.GV2_MIGRATION_DISABLE_INVITE) {
+      if (!isMe(contact.attributes) && window.GV2_MIGRATION_DISABLE_INVITE) {
         window.log.warn(
           `getGroupMigrationMembers/${logId}: pendingMembersV2 - skipping ${e164} due to GV2_MIGRATION_DISABLE_INVITE flag`
         );
@@ -1932,12 +2046,9 @@ export async function initiateMigrationToGroupV2(
   // Ensure we have the credentials we need before attempting GroupsV2 operations
   await maybeFetchNewCredentials();
 
-  let ourProfileKey: undefined | string;
-
   try {
-    await conversation.queueJob(async () => {
-      const ACCESS_ENUM =
-        window.textsecure.protobuf.AccessControl.AccessRequired;
+    await conversation.queueJob('initiateMigrationToGroupV2', async () => {
+      const ACCESS_ENUM = Proto.AccessControl.AccessRequired;
 
       const isEligible = isGroupEligibleToMigrate(conversation);
       const previousGroupV1Id = conversation.get('groupId');
@@ -1949,18 +2060,20 @@ export async function initiateMigrationToGroupV2(
       }
 
       const groupV1IdBuffer = fromEncodedBinaryToArrayBuffer(previousGroupV1Id);
-      const masterKeyBuffer = await deriveMasterKeyFromGroupV1(groupV1IdBuffer);
+      const masterKeyBuffer = new FIXMEU8(
+        await deriveMasterKeyFromGroupV1(groupV1IdBuffer)
+      );
       const fields = deriveGroupFields(masterKeyBuffer);
 
-      const groupId = arrayBufferToBase64(fields.id);
+      const groupId = Bytes.toBase64(fields.id);
       const logId = `groupv2(${groupId})`;
       window.log.info(
         `initiateMigrationToGroupV2/${logId}: Migrating from ${conversation.idForLogging()}`
       );
 
-      const masterKey = arrayBufferToBase64(masterKeyBuffer);
-      const secretParams = arrayBufferToBase64(fields.secretParams);
-      const publicParams = arrayBufferToBase64(fields.publicParams);
+      const masterKey = Bytes.toBase64(masterKeyBuffer);
+      const secretParams = Bytes.toBase64(fields.secretParams);
+      const publicParams = Bytes.toBase64(fields.publicParams);
 
       const ourConversationId = window.ConversationController.getOurConversationId();
       if (!ourConversationId) {
@@ -1976,7 +2089,6 @@ export async function initiateMigrationToGroupV2(
           `initiateMigrationToGroupV2/${logId}: cannot get our own conversation. Cannot migrate`
         );
       }
-      ourProfileKey = ourConversation.get('profileKey');
 
       const {
         membersV2,
@@ -2084,8 +2196,8 @@ export async function initiateMigrationToGroupV2(
         },
       });
 
-      if (window.storage.isGroupBlocked(previousGroupV1Id)) {
-        window.storage.addBlockedGroup(groupId);
+      if (window.storage.blocked.isGroupBlocked(previousGroupV1Id)) {
+        window.storage.blocked.addBlockedGroup(groupId);
       }
 
       // Save these most recent updates to conversation
@@ -2093,7 +2205,7 @@ export async function initiateMigrationToGroupV2(
     });
   } catch (error) {
     const logId = conversation.idForLogging();
-    if (!conversation.isGroupV1()) {
+    if (!getIsGroupV1(conversation.attributes)) {
       throw error;
     }
 
@@ -2116,20 +2228,34 @@ export async function initiateMigrationToGroupV2(
   const logId = conversation.idForLogging();
   const timestamp = Date.now();
 
+  const ourProfileKey:
+    | ArrayBuffer
+    | undefined = await ourProfileKeyService.get();
+
+  const { ContentHint } = Proto.UnidentifiedSenderMessage.Message;
+  const sendOptions = await getSendOptions(conversation.attributes);
+
   await wrapWithSyncMessageSend({
     conversation,
-    logId: `sendMessageToGroup/${logId}`,
-    send: async sender =>
+    logId: `sendToGroup/${logId}`,
+    messageIds: [],
+    send: async () =>
       // Minimal message to notify group members about migration
-      sender.sendMessageToGroup({
-        groupV2: conversation.getGroupV2Info({
-          includePendingMembers: true,
-        }),
-        timestamp,
-        profileKey: ourProfileKey
-          ? base64ToArrayBuffer(ourProfileKey)
-          : undefined,
+      window.Signal.Util.sendToGroup({
+        groupSendOptions: {
+          groupV2: conversation.getGroupV2Info({
+            includePendingMembers: true,
+          }),
+          timestamp,
+          profileKey: ourProfileKey,
+        },
+        conversation,
+        contentHint: ContentHint.RESENDABLE,
+        messageId: undefined,
+        sendOptions,
+        sendType: 'groupChange',
       }),
+    sendType: 'groupChange',
     timestamp,
   });
 }
@@ -2137,12 +2263,16 @@ export async function initiateMigrationToGroupV2(
 export async function wrapWithSyncMessageSend({
   conversation,
   logId,
+  messageIds,
   send,
+  sendType,
   timestamp,
 }: {
   conversation: ConversationModel;
   logId: string;
-  send: (sender: MessageSender) => Promise<CallbackResultType | undefined>;
+  messageIds: Array<string>;
+  send: (sender: MessageSender) => Promise<CallbackResultType>;
+  sendType: SendTypesType;
   timestamp: number;
 }): Promise<void> {
   const sender = window.textsecure.messaging;
@@ -2154,7 +2284,7 @@ export async function wrapWithSyncMessageSend({
 
   let response: CallbackResultType | undefined;
   try {
-    response = await send(sender);
+    response = await handleMessageSend(send(sender), { messageIds, sendType });
   } catch (error) {
     if (conversation.processSendResponse(error)) {
       response = error;
@@ -2189,16 +2319,24 @@ export async function wrapWithSyncMessageSend({
     );
   }
 
-  await sender.sendSyncMessage(
-    dataMessage,
-    timestamp,
-    ourConversation.get('e164'),
-    ourConversation.get('uuid'),
-    null, // expirationStartTimestamp
-    [], // sentTo
-    [], // unidentifiedDeliveries
-    undefined, // isUpdate
-    undefined // options
+  if (window.ConversationController.areWePrimaryDevice()) {
+    window.log.warn(
+      `wrapWithSyncMessageSend/${logId}: We are primary device; not sync message`
+    );
+    return;
+  }
+
+  const options = await getSendOptions(ourConversation.attributes);
+  await handleMessageSend(
+    sender.sendSyncMessage({
+      destination: ourConversation.get('e164'),
+      destinationUuid: ourConversation.get('uuid'),
+      encodedDataMessage: dataMessage,
+      expirationStartTimestamp: null,
+      options,
+      timestamp,
+    }),
+    { messageIds, sendType }
   );
 }
 
@@ -2211,7 +2349,7 @@ export async function waitThenRespondToGroupV2Migration(
   // Then wait to process all outstanding messages for this conversation
   const { conversation } = options;
 
-  await conversation.queueJob(async () => {
+  await conversation.queueJob('waitThenRespondToGroupV2Migration', async () => {
     try {
       // And finally try to migrate the group
       await respondToGroupV2Migration(options);
@@ -2269,7 +2407,7 @@ export async function joinGroupV2ViaLinkAndMigrate({
   inviteLinkPassword: string;
   revision: number;
 }): Promise<void> {
-  const isGroupV1 = conversation.isGroupV1();
+  const isGroupV1 = getIsGroupV1(conversation.attributes);
   const previousGroupV1Id = conversation.get('groupId');
 
   if (!isGroupV1 || !previousGroupV1Id) {
@@ -2280,18 +2418,20 @@ export async function joinGroupV2ViaLinkAndMigrate({
 
   // Derive GroupV2 fields
   const groupV1IdBuffer = fromEncodedBinaryToArrayBuffer(previousGroupV1Id);
-  const masterKeyBuffer = await deriveMasterKeyFromGroupV1(groupV1IdBuffer);
+  const masterKeyBuffer = new FIXMEU8(
+    await deriveMasterKeyFromGroupV1(groupV1IdBuffer)
+  );
   const fields = deriveGroupFields(masterKeyBuffer);
 
-  const groupId = arrayBufferToBase64(fields.id);
+  const groupId = Bytes.toBase64(fields.id);
   const logId = idForLogging(groupId);
   window.log.info(
     `joinGroupV2ViaLinkAndMigrate/${logId}: Migrating from ${conversation.idForLogging()}`
   );
 
-  const masterKey = arrayBufferToBase64(masterKeyBuffer);
-  const secretParams = arrayBufferToBase64(fields.secretParams);
-  const publicParams = arrayBufferToBase64(fields.publicParams);
+  const masterKey = Bytes.toBase64(masterKeyBuffer);
+  const secretParams = Bytes.toBase64(fields.secretParams);
+  const publicParams = Bytes.toBase64(fields.publicParams);
 
   // A mini-migration, which will not show dropped/invited members
   const newAttributes = {
@@ -2319,7 +2459,7 @@ export async function joinGroupV2ViaLinkAndMigrate({
     derivedGroupV2Id: undefined,
     members: undefined,
   };
-  const groupChangeMessages = [
+  const groupChangeMessages: Array<MessageAttributesType> = [
     {
       ...generateBasicMessage(),
       type: 'group-v1-migration',
@@ -2359,7 +2499,7 @@ export async function respondToGroupV2Migration({
   // Ensure we have the credentials we need before attempting GroupsV2 operations
   await maybeFetchNewCredentials();
 
-  const isGroupV1 = conversation.isGroupV1();
+  const isGroupV1 = getIsGroupV1(conversation.attributes);
   const previousGroupV1Id = conversation.get('groupId');
 
   if (!isGroupV1 || !previousGroupV1Id) {
@@ -2376,18 +2516,20 @@ export async function respondToGroupV2Migration({
 
   // Derive GroupV2 fields
   const groupV1IdBuffer = fromEncodedBinaryToArrayBuffer(previousGroupV1Id);
-  const masterKeyBuffer = await deriveMasterKeyFromGroupV1(groupV1IdBuffer);
+  const masterKeyBuffer = new FIXMEU8(
+    await deriveMasterKeyFromGroupV1(groupV1IdBuffer)
+  );
   const fields = deriveGroupFields(masterKeyBuffer);
 
-  const groupId = arrayBufferToBase64(fields.id);
+  const groupId = Bytes.toBase64(fields.id);
   const logId = idForLogging(groupId);
   window.log.info(
     `respondToGroupV2Migration/${logId}: Migrating from ${conversation.idForLogging()}`
   );
 
-  const masterKey = arrayBufferToBase64(masterKeyBuffer);
-  const secretParams = arrayBufferToBase64(fields.secretParams);
-  const publicParams = arrayBufferToBase64(fields.publicParams);
+  const masterKey = Bytes.toBase64(masterKeyBuffer);
+  const secretParams = Bytes.toBase64(fields.secretParams);
+  const publicParams = Bytes.toBase64(fields.publicParams);
 
   const previousGroupV1Members = conversation.get('members');
   const previousGroupV1MembersIds = conversation.getMemberIds();
@@ -2416,7 +2558,7 @@ export async function respondToGroupV2Migration({
     members: undefined,
   };
 
-  let firstGroupState: GroupClass | undefined | null;
+  let firstGroupState: Proto.IGroup | null | undefined;
 
   try {
     const response: GroupLogResponseType = await makeRequestWithTemporalRetry({
@@ -2547,8 +2689,8 @@ export async function respondToGroupV2Migration({
     },
   });
 
-  if (window.storage.isGroupBlocked(previousGroupV1Id)) {
-    window.storage.addBlockedGroup(groupId);
+  if (window.storage.blocked.isGroupBlocked(previousGroupV1Id)) {
+    window.storage.blocked.addBlockedGroup(groupId);
   }
 
   // Save these most recent updates to conversation
@@ -2576,19 +2718,42 @@ type MaybeUpdatePropsType = {
   dropInitialJoinMessage?: boolean;
 };
 
+const FIVE_MINUTES = 1000 * 60 * 5;
+
 export async function waitThenMaybeUpdateGroup(
-  options: MaybeUpdatePropsType
+  options: MaybeUpdatePropsType,
+  { viaSync = false } = {}
 ): Promise<void> {
+  const { conversation } = options;
+
+  if (conversation.isBlocked()) {
+    window.log.info(
+      `waitThenMaybeUpdateGroup: Group ${conversation.idForLogging()} is blocked, returning early`
+    );
+    return;
+  }
+
   // First wait to process all incoming messages on the websocket
   await window.waitForEmptyEventQueue();
 
-  // Then wait to process all outstanding messages for this conversation
-  const { conversation } = options;
+  // Then make sure we haven't fetched this group too recently
+  const { lastSuccessfulGroupFetch = 0 } = conversation;
+  if (isMoreRecentThan(lastSuccessfulGroupFetch, FIVE_MINUTES)) {
+    const waitTime = lastSuccessfulGroupFetch + FIVE_MINUTES - Date.now();
+    window.log.info(
+      `waitThenMaybeUpdateGroup/${conversation.idForLogging()}: group update ` +
+        `was fetched recently, skipping for ${waitTime}ms`
+    );
+    return;
+  }
 
-  await conversation.queueJob(async () => {
+  // Then wait to process all outstanding messages for this conversation
+  await conversation.queueJob('waitThenMaybeUpdateGroup', async () => {
     try {
       // And finally try to update the group
-      await maybeUpdateGroup(options);
+      await maybeUpdateGroup(options, { viaSync });
+
+      conversation.lastSuccessfulGroupFetch = Date.now();
     } catch (error) {
       window.log.error(
         `waitThenMaybeUpdateGroup/${conversation.idForLogging()}: maybeUpdateGroup failure:`,
@@ -2598,14 +2763,17 @@ export async function waitThenMaybeUpdateGroup(
   });
 }
 
-export async function maybeUpdateGroup({
-  conversation,
-  dropInitialJoinMessage,
-  groupChangeBase64,
-  newRevision,
-  receivedAt,
-  sentAt,
-}: MaybeUpdatePropsType): Promise<void> {
+export async function maybeUpdateGroup(
+  {
+    conversation,
+    dropInitialJoinMessage,
+    groupChangeBase64,
+    newRevision,
+    receivedAt,
+    sentAt,
+  }: MaybeUpdatePropsType,
+  { viaSync = false } = {}
+): Promise<void> {
   const logId = conversation.idForLogging();
 
   try {
@@ -2620,7 +2788,10 @@ export async function maybeUpdateGroup({
       dropInitialJoinMessage,
     });
 
-    await updateGroup({ conversation, receivedAt, sentAt, updates });
+    await updateGroup(
+      { conversation, receivedAt, sentAt, updates },
+      { viaSync }
+    );
   } catch (error) {
     window.log.error(
       `maybeUpdateGroup/${logId}: Failed to update group:`,
@@ -2630,17 +2801,20 @@ export async function maybeUpdateGroup({
   }
 }
 
-async function updateGroup({
-  conversation,
-  receivedAt,
-  sentAt,
-  updates,
-}: {
-  conversation: ConversationModel;
-  receivedAt?: number;
-  sentAt?: number;
-  updates: UpdatesResultType;
-}): Promise<void> {
+async function updateGroup(
+  {
+    conversation,
+    receivedAt,
+    sentAt,
+    updates,
+  }: {
+    conversation: ConversationModel;
+    receivedAt?: number;
+    sentAt?: number;
+    updates: UpdatesResultType;
+  },
+  { viaSync = false } = {}
+): Promise<void> {
   const { newAttributes, groupChangeMessages, members } = updates;
 
   const startingRevision = conversation.get('revision');
@@ -2663,15 +2837,21 @@ async function updateGroup({
   const previousId = conversation.get('groupId');
   const idChanged = previousId && previousId !== newAttributes.groupId;
 
+  // We force this conversation into the left pane if this is the first time we've
+  //   fetched data about it, and we were able to fetch its name. Nobody likes to see
+  //   Unknown Group in the left pane.
+  let activeAt = null;
+  if (viaSync) {
+    activeAt = null;
+  } else if ((isInitialDataFetch || justJoinedGroup) && newAttributes.name) {
+    activeAt = initialSentAt;
+  } else {
+    activeAt = newAttributes.active_at;
+  }
+
   conversation.set({
     ...newAttributes,
-    // We force this conversation into the left pane if this is the first time we've
-    //   fetched data about it, and we were able to fetch its name. Nobody likes to see
-    //   Unknown Group in the left pane.
-    active_at:
-      (isInitialDataFetch || justJoinedGroup) && newAttributes.name
-        ? initialSentAt
-        : newAttributes.active_at,
+    active_at: activeAt,
     temporaryMemberCount: isInGroup
       ? undefined
       : newAttributes.temporaryMemberCount,
@@ -2758,10 +2938,8 @@ async function getGroupUpdates({
     (isInitialCreationMessage || weAreAwaitingApproval || isOneVersionUp)
   ) {
     window.log.info(`getGroupUpdates/${logId}: Processing just one change`);
-    const groupChangeBuffer = base64ToArrayBuffer(groupChangeBase64);
-    const groupChange = window.textsecure.protobuf.GroupChange.decode(
-      groupChangeBuffer
-    );
+    const groupChangeBuffer = Bytes.fromBase64(groupChangeBase64);
+    const groupChange = Proto.GroupChange.decode(groupChangeBuffer);
     const isChangeSupported =
       !isNumber(groupChange.changeEpoch) ||
       groupChange.changeEpoch <= SUPPORTED_CHANGE_EPOCH;
@@ -2887,7 +3065,7 @@ async function updateGroupViaSingleChange({
   serverPublicParamsBase64,
 }: {
   group: ConversationAttributesType;
-  groupChange: GroupChangeClass;
+  groupChange: Proto.IGroupChange;
   newRevision: number;
   serverPublicParamsBase64: string;
 }): Promise<UpdatesResultType> {
@@ -3018,7 +3196,7 @@ async function generateLeftGroupChanges(
   const isNewlyRemoved =
     existingMembers.length > (newAttributes.membersV2 || []).length;
 
-  const youWereRemovedMessage = {
+  const youWereRemovedMessage: MessageAttributesType = {
     ...generateBasicMessage(),
     type: 'group-v2-change',
     groupV2Change: {
@@ -3058,10 +3236,10 @@ function getGroupCredentials({
   );
 
   return {
-    groupPublicParamsHex: arrayBufferToHex(
-      base64ToArrayBuffer(groupPublicParamsBase64)
+    groupPublicParamsHex: Bytes.toHex(
+      Bytes.fromBase64(groupPublicParamsBase64)
     ),
-    authCredentialPresentationHex: arrayBufferToHex(presentation),
+    authCredentialPresentationHex: Bytes.toHex(presentation),
   };
 }
 
@@ -3098,7 +3276,7 @@ async function getGroupDelta({
   let revisionToFetch = isNumber(currentRevision) ? currentRevision + 1 : 0;
 
   let response;
-  const changes: Array<GroupChangesClass> = [];
+  const changes: Array<Proto.IGroupChanges> = [];
   do {
     // eslint-disable-next-line no-await-in-loop
     response = await sender.getGroupLog(revisionToFetch, options);
@@ -3124,7 +3302,7 @@ async function integrateGroupChanges({
 }: {
   group: ConversationAttributesType;
   newRevision: number;
-  changes: Array<GroupChangesClass>;
+  changes: Array<Proto.IGroupChanges>;
 }): Promise<UpdatesResultType> {
   const logId = idForLogging(group.groupId);
   let attributes = group;
@@ -3161,8 +3339,8 @@ async function integrateGroupChanges({
         } = await integrateGroupChange({
           group: attributes,
           newRevision,
-          groupChange,
-          groupState,
+          groupChange: dropNull(groupChange),
+          groupState: dropNull(groupState),
         });
 
         attributes = newAttributes;
@@ -3218,8 +3396,8 @@ async function integrateGroupChange({
   newRevision,
 }: {
   group: ConversationAttributesType;
-  groupChange?: GroupChangeClass;
-  groupState?: GroupClass;
+  groupChange?: Proto.IGroupChange;
+  groupState?: Proto.IGroup;
   newRevision: number;
 }): Promise<UpdatesResultType> {
   const logId = idForLogging(group.groupId);
@@ -3244,13 +3422,13 @@ async function integrateGroupChange({
   // These need to be populated from the groupChange. But we might not get one!
   let isChangeSupported = false;
   let isMoreThanOneVersionUp = false;
-  let groupChangeActions: undefined | GroupChangeClass.Actions;
-  let decryptedChangeActions: undefined | GroupChangeClass.Actions;
+  let groupChangeActions: undefined | Proto.GroupChange.IActions;
+  let decryptedChangeActions: undefined | DecryptedGroupChangeActions;
   let sourceConversationId: undefined | string;
 
   if (groupChange) {
-    groupChangeActions = window.textsecure.protobuf.GroupChange.Actions.decode(
-      groupChange.actions.toArrayBuffer()
+    groupChangeActions = Proto.GroupChange.Actions.decode(
+      groupChange.actions || new FIXMEU8(0)
     );
 
     if (
@@ -3270,7 +3448,12 @@ async function integrateGroupChange({
       logId
     );
 
+    strictAssert(
+      decryptedChangeActions !== undefined,
+      'Should have decrypted group actions'
+    );
     const { sourceUuid } = decryptedChangeActions;
+    strictAssert(sourceUuid, 'Should have source UUID');
     const sourceConversation = window.ConversationController.getOrCreate(
       sourceUuid,
       'private'
@@ -3399,7 +3582,7 @@ async function getCurrentGroupState({
     logId
   );
 
-  const oldVersion = group.version;
+  const oldVersion = group.revision;
   const newVersion = decryptedGroupState.version;
   window.log.info(
     `getCurrentGroupState/${logId}: Applying full group state, from version ${oldVersion} to ${newVersion}.`
@@ -3434,7 +3617,7 @@ function extractDiffs({
   const logId = idForLogging(old.groupId);
   const details: Array<GroupV2ChangeDetailType> = [];
   const ourConversationId = window.ConversationController.getOurConversationId();
-  const ACCESS_ENUM = window.textsecure.protobuf.AccessControl.AccessRequired;
+  const ACCESS_ENUM = Proto.AccessControl.AccessRequired;
 
   let areWeInGroup = false;
   let areWeInvitedToGroup = false;
@@ -3525,6 +3708,15 @@ function extractDiffs({
   ) {
     details.push({
       type: 'group-link-reset',
+    });
+  }
+
+  // description
+  if (old.description !== current.description) {
+    details.push({
+      type: 'description',
+      removed: !current.description,
+      description: current.description,
     });
   }
 
@@ -3703,6 +3895,15 @@ function extractDiffs({
     });
   });
 
+  // announcementsOnly
+
+  if (old.announcementsOnly !== current.announcementsOnly) {
+    details.push({
+      type: 'announcements-only',
+      announcementsOnly: Boolean(current.announcementsOnly),
+    });
+  }
+
   // final processing
 
   let message: MessageAttributesType | undefined;
@@ -3806,8 +4007,7 @@ function extractDiffs({
       ...generateBasicMessage(),
       type: 'timer-notification',
       sourceUuid,
-      flags:
-        window.textsecure.protobuf.DataMessage.Flags.EXPIRATION_TIMER_UPDATE,
+      flags: Proto.DataMessage.Flags.EXPIRATION_TIMER_UPDATE,
       expirationTimerUpdate: {
         expireTimer: current.expireTimer || 0,
         sourceUuid,
@@ -3826,13 +4026,13 @@ function extractDiffs({
 
 function profileKeysToMembers(items: Array<GroupChangeMemberType>) {
   return items.map(item => ({
-    profileKey: arrayBufferToBase64(item.profileKey),
+    profileKey: Bytes.toBase64(item.profileKey),
     uuid: item.uuid,
   }));
 }
 
 type GroupChangeMemberType = {
-  profileKey: ArrayBuffer;
+  profileKey: Uint8Array;
   uuid: string;
 };
 type GroupApplyResultType = {
@@ -3845,15 +4045,15 @@ async function applyGroupChange({
   group,
   sourceConversationId,
 }: {
-  actions: GroupChangeClass.Actions;
+  actions: DecryptedGroupChangeActions;
   group: ConversationAttributesType;
   sourceConversationId: string;
 }): Promise<GroupApplyResultType> {
   const logId = idForLogging(group.groupId);
   const ourConversationId = window.ConversationController.getOurConversationId();
 
-  const ACCESS_ENUM = window.textsecure.protobuf.AccessControl.AccessRequired;
-  const MEMBER_ROLE_ENUM = window.textsecure.protobuf.Member.Role;
+  const ACCESS_ENUM = Proto.AccessControl.AccessRequired;
+  const MEMBER_ROLE_ENUM = Proto.Member.Role;
 
   const version = actions.version || 0;
   const result = { ...group };
@@ -3878,7 +4078,7 @@ async function applyGroupChange({
   // version?: number;
   result.revision = version;
 
-  // addMembers?: Array<GroupChangeClass.Actions.AddMemberAction>;
+  // addMembers?: Array<GroupChange.Actions.AddMemberAction>;
   (actions.addMembers || []).forEach(addMember => {
     const { added } = addMember;
     if (!added) {
@@ -3928,7 +4128,7 @@ async function applyGroupChange({
     }
   });
 
-  // deleteMembers?: Array<GroupChangeClass.Actions.DeleteMemberAction>;
+  // deleteMembers?: Array<GroupChange.Actions.DeleteMemberAction>;
   (actions.deleteMembers || []).forEach(deleteMember => {
     const { deletedUserId } = deleteMember;
     if (!deletedUserId) {
@@ -3951,7 +4151,7 @@ async function applyGroupChange({
     }
   });
 
-  // modifyMemberRoles?: Array<GroupChangeClass.Actions.ModifyMemberRoleAction>;
+  // modifyMemberRoles?: Array<GroupChange.Actions.ModifyMemberRoleAction>;
   (actions.modifyMemberRoles || []).forEach(modifyMemberRole => {
     const { role, userId } = modifyMemberRole;
     if (!role || !userId) {
@@ -3976,7 +4176,7 @@ async function applyGroupChange({
   });
 
   // modifyMemberProfileKeys?:
-  // Array<GroupChangeClass.Actions.ModifyMemberProfileKeyAction>;
+  // Array<GroupChange.Actions.ModifyMemberProfileKeyAction>;
   (actions.modifyMemberProfileKeys || []).forEach(modifyMemberProfileKey => {
     const { profileKey, uuid } = modifyMemberProfileKey;
     if (!profileKey || !uuid) {
@@ -3992,7 +4192,7 @@ async function applyGroupChange({
   });
 
   // addPendingMembers?: Array<
-  //   GroupChangeClass.Actions.AddMemberPendingProfileKeyAction
+  //   GroupChange.Actions.AddMemberPendingProfileKeyAction
   // >;
   (actions.addPendingMembers || []).forEach(addPendingMember => {
     const { added } = addPendingMember;
@@ -4036,7 +4236,7 @@ async function applyGroupChange({
   });
 
   // deletePendingMembers?: Array<
-  //   GroupChangeClass.Actions.DeleteMemberPendingProfileKeyAction
+  //   GroupChange.Actions.DeleteMemberPendingProfileKeyAction
   // >;
   (actions.deletePendingMembers || []).forEach(deletePendingMember => {
     const { deletedUserId } = deletePendingMember;
@@ -4061,7 +4261,7 @@ async function applyGroupChange({
   });
 
   // promotePendingMembers?: Array<
-  //   GroupChangeClass.Actions.PromoteMemberPendingProfileKeyAction
+  //   GroupChange.Actions.PromoteMemberPendingProfileKeyAction
   // >;
   (actions.promotePendingMembers || []).forEach(promotePendingMember => {
     const { profileKey, uuid } = promotePendingMember;
@@ -4105,7 +4305,7 @@ async function applyGroupChange({
     });
   });
 
-  // modifyTitle?: GroupChangeClass.Actions.ModifyTitleAction;
+  // modifyTitle?: GroupChange.Actions.ModifyTitleAction;
   if (actions.modifyTitle) {
     const { title } = actions.modifyTitle;
     if (title && title.content === 'title') {
@@ -4118,16 +4318,16 @@ async function applyGroupChange({
     }
   }
 
-  // modifyAvatar?: GroupChangeClass.Actions.ModifyAvatarAction;
+  // modifyAvatar?: GroupChange.Actions.ModifyAvatarAction;
   if (actions.modifyAvatar) {
     const { avatar } = actions.modifyAvatar;
-    await applyNewAvatar(avatar, result, logId);
+    await applyNewAvatar(dropNull(avatar), result, logId);
   }
 
   // modifyDisappearingMessagesTimer?:
-  //   GroupChangeClass.Actions.ModifyDisappearingMessagesTimerAction;
+  //   GroupChange.Actions.ModifyDisappearingMessagesTimerAction;
   if (actions.modifyDisappearingMessagesTimer) {
-    const disappearingMessagesTimer: GroupAttributeBlobClass | undefined =
+    const disappearingMessagesTimer: Proto.GroupAttributeBlob | undefined =
       actions.modifyDisappearingMessagesTimer.timer;
     if (
       disappearingMessagesTimer &&
@@ -4150,7 +4350,7 @@ async function applyGroupChange({
   };
 
   // modifyAttributesAccess?:
-  // GroupChangeClass.Actions.ModifyAttributesAccessControlAction;
+  // GroupChange.Actions.ModifyAttributesAccessControlAction;
   if (actions.modifyAttributesAccess) {
     result.accessControl = {
       ...result.accessControl,
@@ -4159,7 +4359,7 @@ async function applyGroupChange({
     };
   }
 
-  // modifyMemberAccess?: GroupChangeClass.Actions.ModifyMembersAccessControlAction;
+  // modifyMemberAccess?: GroupChange.Actions.ModifyMembersAccessControlAction;
   if (actions.modifyMemberAccess) {
     result.accessControl = {
       ...result.accessControl,
@@ -4168,7 +4368,7 @@ async function applyGroupChange({
   }
 
   // modifyAddFromInviteLinkAccess?:
-  //   GroupChangeClass.Actions.ModifyAddFromInviteLinkAccessControlAction;
+  //   GroupChange.Actions.ModifyAddFromInviteLinkAccessControlAction;
   if (actions.modifyAddFromInviteLinkAccess) {
     result.accessControl = {
       ...result.accessControl,
@@ -4179,7 +4379,7 @@ async function applyGroupChange({
   }
 
   // addMemberPendingAdminApprovals?: Array<
-  //   GroupChangeClass.Actions.AddMemberPendingAdminApprovalAction
+  //   GroupChange.Actions.AddMemberPendingAdminApprovalAction
   // >;
   (actions.addMemberPendingAdminApprovals || []).forEach(
     pendingAdminApproval => {
@@ -4229,7 +4429,7 @@ async function applyGroupChange({
   );
 
   // deleteMemberPendingAdminApprovals?: Array<
-  //   GroupChangeClass.Actions.DeleteMemberPendingAdminApprovalAction
+  //   GroupChange.Actions.DeleteMemberPendingAdminApprovalAction
   // >;
   (actions.deleteMemberPendingAdminApprovals || []).forEach(
     deleteAdminApproval => {
@@ -4256,7 +4456,7 @@ async function applyGroupChange({
   );
 
   // promoteMemberPendingAdminApprovals?: Array<
-  //   GroupChangeClass.Actions.PromoteMemberPendingAdminApprovalAction
+  //   GroupChange.Actions.PromoteMemberPendingAdminApprovalAction
   // >;
   (actions.promoteMemberPendingAdminApprovals || []).forEach(
     promoteAdminApproval => {
@@ -4302,13 +4502,26 @@ async function applyGroupChange({
     }
   );
 
-  // modifyInviteLinkPassword?: GroupChangeClass.Actions.ModifyInviteLinkPasswordAction;
+  // modifyInviteLinkPassword?: GroupChange.Actions.ModifyInviteLinkPasswordAction;
   if (actions.modifyInviteLinkPassword) {
     const { inviteLinkPassword } = actions.modifyInviteLinkPassword;
     if (inviteLinkPassword) {
       result.groupInviteLinkPassword = inviteLinkPassword;
     } else {
       result.groupInviteLinkPassword = undefined;
+    }
+  }
+
+  // modifyDescription?: GroupChange.Actions.ModifyDescriptionAction;
+  if (actions.modifyDescription) {
+    const { descriptionBytes } = actions.modifyDescription;
+    if (descriptionBytes && descriptionBytes.content === 'descriptionText') {
+      result.description = descriptionBytes.descriptionText;
+    } else {
+      window.log.warn(
+        `applyGroupChange/${logId}: Clearing group description due to missing data.`
+      );
+      result.description = undefined;
     }
   }
 
@@ -4338,17 +4551,17 @@ export async function decryptGroupAvatar(
     );
   }
 
-  const ciphertext = await sender.getGroupAvatar(avatarKey);
+  const ciphertext = new FIXMEU8(await sender.getGroupAvatar(avatarKey));
   const clientZkGroupCipher = getClientZkGroupCipher(secretParamsBase64);
   const plaintext = decryptGroupBlob(clientZkGroupCipher, ciphertext);
-  const blob = window.textsecure.protobuf.GroupAttributeBlob.decode(plaintext);
+  const blob = Proto.GroupAttributeBlob.decode(plaintext);
   if (blob.content !== 'avatar') {
     throw new Error(
       `decryptGroupAvatar: Returned blob had incorrect content: ${blob.content}`
     );
   }
 
-  return blob.avatar.toArrayBuffer();
+  return typedArrayToArrayBuffer(blob.avatar);
 }
 
 // Ovewriting result.avatar as part of functionality
@@ -4409,12 +4622,12 @@ async function applyGroupState({
   sourceConversationId,
 }: {
   group: ConversationAttributesType;
-  groupState: GroupClass;
+  groupState: DecryptedGroupState;
   sourceConversationId?: string;
 }): Promise<GroupApplyResultType> {
   const logId = idForLogging(group.groupId);
-  const ACCESS_ENUM = window.textsecure.protobuf.AccessControl.AccessRequired;
-  const MEMBER_ROLE_ENUM = window.textsecure.protobuf.Member.Role;
+  const ACCESS_ENUM = Proto.AccessControl.AccessRequired;
+  const MEMBER_ROLE_ENUM = Proto.Member.Role;
   const version = groupState.version || 0;
   const result = { ...group };
   const newProfileKeys: Array<GroupChangeMemberType> = [];
@@ -4432,7 +4645,7 @@ async function applyGroupState({
   }
 
   // avatar
-  await applyNewAvatar(groupState.avatar, result, logId);
+  await applyNewAvatar(dropNull(groupState.avatar), result, logId);
 
   // disappearingMessagesTimer
   // Note: during decryption, disappearingMessageTimer becomes a GroupAttributeBlob
@@ -4463,7 +4676,7 @@ async function applyGroupState({
 
   // members
   if (groupState.members) {
-    result.membersV2 = groupState.members.map((member: MemberClass) => {
+    result.membersV2 = groupState.members.map(member => {
       const conversation = window.ConversationController.getOrCreate(
         member.userId,
         'private'
@@ -4489,10 +4702,12 @@ async function applyGroupState({
         );
       }
 
-      newProfileKeys.push({
-        profileKey: member.profileKey,
-        uuid: member.userId,
-      });
+      if (member.profileKey) {
+        newProfileKeys.push({
+          profileKey: member.profileKey,
+          uuid: member.userId,
+        });
+      }
 
       return {
         role: member.role || MEMBER_ROLE_ENUM.DEFAULT,
@@ -4505,7 +4720,7 @@ async function applyGroupState({
   // membersPendingProfileKey
   if (groupState.membersPendingProfileKey) {
     result.pendingMembersV2 = groupState.membersPendingProfileKey.map(
-      (member: MemberPendingProfileKeyClass) => {
+      member => {
         let pending;
         let invitedBy;
 
@@ -4537,10 +4752,12 @@ async function applyGroupState({
           );
         }
 
-        newProfileKeys.push({
-          profileKey: member.member.profileKey,
-          uuid: member.member.userId,
-        });
+        if (member.member.profileKey) {
+          newProfileKeys.push({
+            profileKey: member.member.profileKey,
+            uuid: member.member.userId,
+          });
+        }
 
         return {
           addedByUserId: invitedBy.id,
@@ -4555,7 +4772,7 @@ async function applyGroupState({
   // membersPendingAdminApproval
   if (groupState.membersPendingAdminApproval) {
     result.pendingAdminApprovalV2 = groupState.membersPendingAdminApproval.map(
-      (member: MemberPendingAdminApprovalClass) => {
+      member => {
         let pending;
 
         if (member.userId) {
@@ -4585,6 +4802,14 @@ async function applyGroupState({
     result.groupInviteLinkPassword = undefined;
   }
 
+  // descriptionBytes
+  const { descriptionBytes } = groupState;
+  if (descriptionBytes && descriptionBytes.content === 'descriptionText') {
+    result.description = descriptionBytes.descriptionText;
+  } else {
+    result.description = undefined;
+  }
+
   return {
     newAttributes: result,
     newProfileKeys,
@@ -4592,7 +4817,7 @@ async function applyGroupState({
 }
 
 function isValidRole(role?: number): role is number {
-  const MEMBER_ROLE_ENUM = window.textsecure.protobuf.Member.Role;
+  const MEMBER_ROLE_ENUM = Proto.Member.Role;
 
   return (
     role === MEMBER_ROLE_ENUM.ADMINISTRATOR || role === MEMBER_ROLE_ENUM.DEFAULT
@@ -4600,13 +4825,13 @@ function isValidRole(role?: number): role is number {
 }
 
 function isValidAccess(access?: number): access is number {
-  const ACCESS_ENUM = window.textsecure.protobuf.AccessControl.AccessRequired;
+  const ACCESS_ENUM = Proto.AccessControl.AccessRequired;
 
   return access === ACCESS_ENUM.ADMINISTRATOR || access === ACCESS_ENUM.MEMBER;
 }
 
 function isValidLinkAccess(access?: number): access is number {
-  const ACCESS_ENUM = window.textsecure.protobuf.AccessControl.AccessRequired;
+  const ACCESS_ENUM = Proto.AccessControl.AccessRequired;
 
   return (
     access === ACCESS_ENUM.UNKNOWN ||
@@ -4616,18 +4841,18 @@ function isValidLinkAccess(access?: number): access is number {
   );
 }
 
-function isValidProfileKey(buffer?: ArrayBuffer): boolean {
-  return Boolean(buffer && buffer.byteLength === 32);
-}
-
-function hasData(data: ProtoBinaryType): boolean {
-  return data && data.limit > 0;
+function isValidProfileKey(buffer?: Uint8Array): boolean {
+  return Boolean(buffer && buffer.length === 32);
 }
 
 function normalizeTimestamp(
-  timestamp: ProtoBigNumberType
-): number | ProtoBigNumberType {
+  timestamp: number | Long | null | undefined
+): number {
   if (!timestamp) {
+    return 0;
+  }
+
+  if (typeof timestamp === 'number') {
     return timestamp;
   }
 
@@ -4641,90 +4866,145 @@ function normalizeTimestamp(
   return asNumber;
 }
 
-/* eslint-disable no-param-reassign */
+type DecryptedGroupChangeActions = {
+  version?: number;
+  sourceUuid?: string;
+  addMembers?: ReadonlyArray<{
+    added: DecryptedMember;
+    joinFromInviteLink: boolean;
+  }>;
+  deleteMembers?: ReadonlyArray<{
+    deletedUserId: string;
+  }>;
+  modifyMemberRoles?: ReadonlyArray<{
+    userId: string;
+    role: Proto.Member.Role;
+  }>;
+  modifyMemberProfileKeys?: ReadonlyArray<{
+    profileKey: Uint8Array;
+    uuid: string;
+  }>;
+  addPendingMembers?: ReadonlyArray<{
+    added: DecryptedMemberPendingProfileKey;
+  }>;
+  deletePendingMembers?: ReadonlyArray<{
+    deletedUserId: string;
+  }>;
+  promotePendingMembers?: ReadonlyArray<{
+    profileKey: Uint8Array;
+    uuid: string;
+  }>;
+  modifyTitle?: {
+    title?: Proto.GroupAttributeBlob;
+  };
+  modifyDisappearingMessagesTimer?: {
+    timer?: Proto.GroupAttributeBlob;
+  };
+  addMemberPendingAdminApprovals?: ReadonlyArray<{
+    added: DecryptedMemberPendingAdminApproval;
+  }>;
+  deleteMemberPendingAdminApprovals?: ReadonlyArray<{
+    deletedUserId: string;
+  }>;
+  promoteMemberPendingAdminApprovals?: ReadonlyArray<{
+    userId: string;
+    role: Proto.Member.Role;
+  }>;
+  modifyInviteLinkPassword?: {
+    inviteLinkPassword?: string;
+  };
+  modifyDescription?: {
+    descriptionBytes?: Proto.GroupAttributeBlob;
+  };
+} & Pick<
+  Proto.GroupChange.IActions,
+  | 'modifyAttributesAccess'
+  | 'modifyMemberAccess'
+  | 'modifyAddFromInviteLinkAccess'
+  | 'modifyAvatar'
+>;
 
 function decryptGroupChange(
-  actions: GroupChangeClass.Actions,
+  actions: Readonly<Proto.GroupChange.IActions>,
   groupSecretParams: string,
   logId: string
-): GroupChangeClass.Actions {
+): DecryptedGroupChangeActions {
+  const result: DecryptedGroupChangeActions = {
+    version: dropNull(actions.version),
+  };
+
   const clientZkGroupCipher = getClientZkGroupCipher(groupSecretParams);
 
-  if (hasData(actions.sourceUuid)) {
+  if (actions.sourceUuid && actions.sourceUuid.length !== 0) {
     try {
-      actions.sourceUuid = decryptUuid(
-        clientZkGroupCipher,
-        actions.sourceUuid.toArrayBuffer()
+      result.sourceUuid = normalizeUuid(
+        decryptUuid(clientZkGroupCipher, actions.sourceUuid),
+        'actions.sourceUuid'
       );
     } catch (error) {
       window.log.warn(
-        `decryptGroupChange/${logId}: Unable to decrypt sourceUuid. Clearing sourceUuid.`,
+        `decryptGroupChange/${logId}: Unable to decrypt sourceUuid.`,
         error && error.stack ? error.stack : error
       );
-      actions.sourceUuid = undefined;
     }
 
-    window.normalizeUuids(actions, ['sourceUuid'], 'groups.decryptGroupChange');
-
-    if (!window.isValidGuid(actions.sourceUuid)) {
+    if (!window.isValidGuid(result.sourceUuid)) {
       window.log.warn(
         `decryptGroupChange/${logId}: Invalid sourceUuid. Clearing sourceUuid.`
       );
-      actions.sourceUuid = undefined;
+      result.sourceUuid = undefined;
     }
   } else {
     throw new Error('decryptGroupChange: Missing sourceUuid');
   }
 
-  // addMembers?: Array<GroupChangeClass.Actions.AddMemberAction>;
-  actions.addMembers = compact(
+  // addMembers?: Array<GroupChange.Actions.AddMemberAction>;
+  result.addMembers = compact(
     (actions.addMembers || []).map(addMember => {
-      if (addMember.added) {
-        const decrypted = decryptMember(
-          clientZkGroupCipher,
-          addMember.added,
-          logId
-        );
-        if (!decrypted) {
-          return null;
-        }
-
-        addMember.added = decrypted;
-        return addMember;
+      strictAssert(
+        addMember.added,
+        'decryptGroupChange: AddMember was missing added field!'
+      );
+      const decrypted = decryptMember(
+        clientZkGroupCipher,
+        addMember.added,
+        logId
+      );
+      if (!decrypted) {
+        return null;
       }
-      throw new Error('decryptGroupChange: AddMember was missing added field!');
+
+      return {
+        added: decrypted,
+        joinFromInviteLink: Boolean(addMember.joinFromInviteLink),
+      };
     })
   );
 
-  // deleteMembers?: Array<GroupChangeClass.Actions.DeleteMemberAction>;
-  actions.deleteMembers = compact(
+  // deleteMembers?: Array<GroupChange.Actions.DeleteMemberAction>;
+  result.deleteMembers = compact(
     (actions.deleteMembers || []).map(deleteMember => {
-      if (hasData(deleteMember.deletedUserId)) {
-        try {
-          deleteMember.deletedUserId = decryptUuid(
-            clientZkGroupCipher,
-            deleteMember.deletedUserId.toArrayBuffer()
-          );
-        } catch (error) {
-          window.log.warn(
-            `decryptGroupChange/${logId}: Unable to decrypt deleteMembers.deletedUserId. Dropping member.`,
-            error && error.stack ? error.stack : error
-          );
-          return null;
-        }
-      } else {
-        throw new Error(
-          'decryptGroupChange: deleteMember.deletedUserId was missing'
-        );
-      }
-
-      window.normalizeUuids(
-        deleteMember,
-        ['deletedUserId'],
-        'groups.decryptGroupChange'
+      const { deletedUserId } = deleteMember;
+      strictAssert(
+        Bytes.isNotEmpty(deletedUserId),
+        'decryptGroupChange: deleteMember.deletedUserId was missing'
       );
 
-      if (!window.isValidGuid(deleteMember.deletedUserId)) {
+      let userId: string;
+      try {
+        userId = normalizeUuid(
+          decryptUuid(clientZkGroupCipher, deletedUserId),
+          'actions.deleteMembers.deletedUserId'
+        );
+      } catch (error) {
+        window.log.warn(
+          `decryptGroupChange/${logId}: Unable to decrypt deleteMembers.deletedUserId. Dropping member.`,
+          error && error.stack ? error.stack : error
+        );
+        return null;
+      }
+
+      if (!window.isValidGuid(userId)) {
         window.log.warn(
           `decryptGroupChange/${logId}: Dropping deleteMember due to invalid userId`
         );
@@ -4732,39 +5012,33 @@ function decryptGroupChange(
         return null;
       }
 
-      return deleteMember;
+      return { deletedUserId: userId };
     })
   );
 
-  // modifyMemberRoles?: Array<GroupChangeClass.Actions.ModifyMemberRoleAction>;
-  actions.modifyMemberRoles = compact(
+  // modifyMemberRoles?: Array<GroupChange.Actions.ModifyMemberRoleAction>;
+  result.modifyMemberRoles = compact(
     (actions.modifyMemberRoles || []).map(modifyMember => {
-      if (hasData(modifyMember.userId)) {
-        try {
-          modifyMember.userId = decryptUuid(
-            clientZkGroupCipher,
-            modifyMember.userId.toArrayBuffer()
-          );
-        } catch (error) {
-          window.log.warn(
-            `decryptGroupChange/${logId}: Unable to decrypt modifyMemberRole.userId. Dropping member.`,
-            error && error.stack ? error.stack : error
-          );
-          return null;
-        }
-      } else {
-        throw new Error(
-          'decryptGroupChange: modifyMemberRole.userId was missing'
-        );
-      }
-
-      window.normalizeUuids(
-        modifyMember,
-        ['userId'],
-        'groups.decryptGroupChange'
+      strictAssert(
+        Bytes.isNotEmpty(modifyMember.userId),
+        'decryptGroupChange: modifyMemberRole.userId was missing'
       );
 
-      if (!window.isValidGuid(modifyMember.userId)) {
+      let userId: string;
+      try {
+        userId = normalizeUuid(
+          decryptUuid(clientZkGroupCipher, modifyMember.userId),
+          'actions.modifyMemberRoles.userId'
+        );
+      } catch (error) {
+        window.log.warn(
+          `decryptGroupChange/${logId}: Unable to decrypt modifyMemberRole.userId. Dropping member.`,
+          error && error.stack ? error.stack : error
+        );
+        return null;
+      }
+
+      if (!window.isValidGuid(userId)) {
         window.log.warn(
           `decryptGroupChange/${logId}: Dropping modifyMemberRole due to invalid userId`
         );
@@ -4772,117 +5046,109 @@ function decryptGroupChange(
         return null;
       }
 
-      if (!isValidRole(modifyMember.role)) {
+      const role = dropNull(modifyMember.role);
+      if (!isValidRole(role)) {
         throw new Error(
           `decryptGroupChange: modifyMemberRole had invalid role ${modifyMember.role}`
         );
       }
 
-      return modifyMember;
+      return {
+        role,
+        userId,
+      };
     })
   );
 
   // modifyMemberProfileKeys?: Array<
-  //   GroupChangeClass.Actions.ModifyMemberProfileKeyAction
+  //   GroupChange.Actions.ModifyMemberProfileKeyAction
   // >;
-  actions.modifyMemberProfileKeys = compact(
+  result.modifyMemberProfileKeys = compact(
     (actions.modifyMemberProfileKeys || []).map(modifyMemberProfileKey => {
-      if (hasData(modifyMemberProfileKey.presentation)) {
-        const { profileKey, uuid } = decryptProfileKeyCredentialPresentation(
-          clientZkGroupCipher,
-          modifyMemberProfileKey.presentation.toArrayBuffer()
-        );
+      const { presentation } = modifyMemberProfileKey;
+      strictAssert(
+        Bytes.isNotEmpty(presentation),
+        'decryptGroupChange: modifyMemberProfileKey.presentation was missing'
+      );
 
-        modifyMemberProfileKey.profileKey = profileKey;
-        modifyMemberProfileKey.uuid = uuid;
+      const decryptedPresentation = decryptProfileKeyCredentialPresentation(
+        clientZkGroupCipher,
+        presentation
+      );
 
-        if (
-          !modifyMemberProfileKey.uuid ||
-          !modifyMemberProfileKey.profileKey
-        ) {
-          throw new Error(
-            'decryptGroupChange: uuid or profileKey missing after modifyMemberProfileKey decryption!'
-          );
-        }
-
-        if (!window.isValidGuid(modifyMemberProfileKey.uuid)) {
-          window.log.warn(
-            `decryptGroupChange/${logId}: Dropping modifyMemberProfileKey due to invalid userId`
-          );
-
-          return null;
-        }
-
-        if (!isValidProfileKey(modifyMemberProfileKey.profileKey)) {
-          throw new Error(
-            'decryptGroupChange: modifyMemberProfileKey had invalid profileKey'
-          );
-        }
-      } else {
+      if (!decryptedPresentation.uuid || !decryptedPresentation.profileKey) {
         throw new Error(
-          'decryptGroupChange: modifyMemberProfileKey.presentation was missing'
+          'decryptGroupChange: uuid or profileKey missing after modifyMemberProfileKey decryption!'
         );
       }
 
-      return modifyMemberProfileKey;
+      if (!window.isValidGuid(decryptedPresentation.uuid)) {
+        window.log.warn(
+          `decryptGroupChange/${logId}: Dropping modifyMemberProfileKey due to invalid userId`
+        );
+
+        return null;
+      }
+
+      if (!isValidProfileKey(decryptedPresentation.profileKey)) {
+        throw new Error(
+          'decryptGroupChange: modifyMemberProfileKey had invalid profileKey'
+        );
+      }
+
+      return decryptedPresentation;
     })
   );
 
   // addPendingMembers?: Array<
-  //   GroupChangeClass.Actions.AddMemberPendingProfileKeyAction
+  //   GroupChange.Actions.AddMemberPendingProfileKeyAction
   // >;
-  actions.addPendingMembers = compact(
+  result.addPendingMembers = compact(
     (actions.addPendingMembers || []).map(addPendingMember => {
-      if (addPendingMember.added) {
-        const decrypted = decryptMemberPendingProfileKey(
-          clientZkGroupCipher,
-          addPendingMember.added,
-          logId
-        );
-        if (!decrypted) {
-          return null;
-        }
-
-        addPendingMember.added = decrypted;
-        return addPendingMember;
-      }
-      throw new Error(
+      strictAssert(
+        addPendingMember.added,
         'decryptGroupChange: addPendingMember was missing added field!'
       );
+      const decrypted = decryptMemberPendingProfileKey(
+        clientZkGroupCipher,
+        addPendingMember.added,
+        logId
+      );
+      if (!decrypted) {
+        return null;
+      }
+
+      return {
+        added: decrypted,
+      };
     })
   );
 
   // deletePendingMembers?: Array<
-  //   GroupChangeClass.Actions.DeleteMemberPendingProfileKeyAction
+  //   GroupChange.Actions.DeleteMemberPendingProfileKeyAction
   // >;
-  actions.deletePendingMembers = compact(
+  result.deletePendingMembers = compact(
     (actions.deletePendingMembers || []).map(deletePendingMember => {
-      if (hasData(deletePendingMember.deletedUserId)) {
-        try {
-          deletePendingMember.deletedUserId = decryptUuid(
-            clientZkGroupCipher,
-            deletePendingMember.deletedUserId.toArrayBuffer()
-          );
-        } catch (error) {
-          window.log.warn(
-            `decryptGroupChange/${logId}: Unable to decrypt deletePendingMembers.deletedUserId. Dropping member.`,
-            error && error.stack ? error.stack : error
-          );
-          return null;
-        }
-      } else {
-        throw new Error(
-          'decryptGroupChange: deletePendingMembers.deletedUserId was missing'
+      const { deletedUserId } = deletePendingMember;
+      strictAssert(
+        Bytes.isNotEmpty(deletedUserId),
+        'decryptGroupChange: deletePendingMembers.deletedUserId was missing'
+      );
+      let userId: string;
+      try {
+        userId = normalizeUuid(
+          decryptUuid(clientZkGroupCipher, deletedUserId),
+          'actions.deletePendingMembers.deletedUserId'
         );
+      } catch (error) {
+        window.log.warn(
+          `decryptGroupChange/${logId}: Unable to decrypt deletePendingMembers.deletedUserId. Dropping member.`,
+          error && error.stack ? error.stack : error
+        );
+        return null;
       }
 
-      window.normalizeUuids(
-        deletePendingMember,
-        ['deletedUserId'],
-        'groups.decryptGroupChange'
-      );
-
-      if (!window.isValidGuid(deletePendingMember.deletedUserId)) {
+      if (!window.isValidGuid(userId)) {
         window.log.warn(
           `decryptGroupChange/${logId}: Dropping deletePendingMember due to invalid deletedUserId`
         );
@@ -4890,195 +5156,200 @@ function decryptGroupChange(
         return null;
       }
 
-      return deletePendingMember;
+      return {
+        deletedUserId: userId,
+      };
     })
   );
 
   // promotePendingMembers?: Array<
-  //   GroupChangeClass.Actions.PromoteMemberPendingProfileKeyAction
+  //   GroupChange.Actions.PromoteMemberPendingProfileKeyAction
   // >;
-  actions.promotePendingMembers = compact(
+  result.promotePendingMembers = compact(
     (actions.promotePendingMembers || []).map(promotePendingMember => {
-      if (hasData(promotePendingMember.presentation)) {
-        const { profileKey, uuid } = decryptProfileKeyCredentialPresentation(
-          clientZkGroupCipher,
-          promotePendingMember.presentation.toArrayBuffer()
-        );
+      const { presentation } = promotePendingMember;
+      strictAssert(
+        Bytes.isNotEmpty(presentation),
+        'decryptGroupChange: promotePendingMember.presentation was missing'
+      );
+      const decryptedPresentation = decryptProfileKeyCredentialPresentation(
+        clientZkGroupCipher,
+        presentation
+      );
 
-        promotePendingMember.profileKey = profileKey;
-        promotePendingMember.uuid = uuid;
-
-        if (!promotePendingMember.uuid || !promotePendingMember.profileKey) {
-          throw new Error(
-            'decryptGroupChange: uuid or profileKey missing after promotePendingMember decryption!'
-          );
-        }
-
-        if (!window.isValidGuid(promotePendingMember.uuid)) {
-          window.log.warn(
-            `decryptGroupChange/${logId}: Dropping modifyMemberProfileKey due to invalid userId`
-          );
-
-          return null;
-        }
-
-        if (!isValidProfileKey(promotePendingMember.profileKey)) {
-          throw new Error(
-            'decryptGroupChange: modifyMemberProfileKey had invalid profileKey'
-          );
-        }
-      } else {
+      if (!decryptedPresentation.uuid || !decryptedPresentation.profileKey) {
         throw new Error(
-          'decryptGroupChange: promotePendingMember.presentation was missing'
+          'decryptGroupChange: uuid or profileKey missing after promotePendingMember decryption!'
         );
       }
 
-      return promotePendingMember;
+      if (!window.isValidGuid(decryptedPresentation.uuid)) {
+        window.log.warn(
+          `decryptGroupChange/${logId}: Dropping modifyMemberProfileKey due to invalid userId`
+        );
+
+        return null;
+      }
+
+      if (!isValidProfileKey(decryptedPresentation.profileKey)) {
+        throw new Error(
+          'decryptGroupChange: modifyMemberProfileKey had invalid profileKey'
+        );
+      }
+
+      return decryptedPresentation;
     })
   );
 
-  // modifyTitle?: GroupChangeClass.Actions.ModifyTitleAction;
-  if (actions.modifyTitle && hasData(actions.modifyTitle.title)) {
-    try {
-      actions.modifyTitle.title = window.textsecure.protobuf.GroupAttributeBlob.decode(
-        decryptGroupBlob(
-          clientZkGroupCipher,
-          actions.modifyTitle.title.toArrayBuffer()
-        )
-      );
-    } catch (error) {
-      window.log.warn(
-        `decryptGroupChange/${logId}: Unable to decrypt modifyTitle.title`,
-        error && error.stack ? error.stack : error
-      );
-      actions.modifyTitle.title = undefined;
+  // modifyTitle?: GroupChange.Actions.ModifyTitleAction;
+  if (actions.modifyTitle) {
+    const { title } = actions.modifyTitle;
+
+    if (Bytes.isNotEmpty(title)) {
+      try {
+        result.modifyTitle = {
+          title: Proto.GroupAttributeBlob.decode(
+            decryptGroupBlob(clientZkGroupCipher, title)
+          ),
+        };
+      } catch (error) {
+        window.log.warn(
+          `decryptGroupChange/${logId}: Unable to decrypt modifyTitle.title`,
+          error && error.stack ? error.stack : error
+        );
+      }
+    } else {
+      result.modifyTitle = {};
     }
-  } else if (actions.modifyTitle) {
-    actions.modifyTitle.title = undefined;
   }
 
-  // modifyAvatar?: GroupChangeClass.Actions.ModifyAvatarAction;
+  // modifyAvatar?: GroupChange.Actions.ModifyAvatarAction;
   // Note: decryption happens during application of the change, on download of the avatar
+  result.modifyAvatar = actions.modifyAvatar;
 
   // modifyDisappearingMessagesTimer?:
-  // GroupChangeClass.Actions.ModifyDisappearingMessagesTimerAction;
-  if (
-    actions.modifyDisappearingMessagesTimer &&
-    hasData(actions.modifyDisappearingMessagesTimer.timer)
-  ) {
-    try {
-      actions.modifyDisappearingMessagesTimer.timer = window.textsecure.protobuf.GroupAttributeBlob.decode(
-        decryptGroupBlob(
-          clientZkGroupCipher,
-          actions.modifyDisappearingMessagesTimer.timer.toArrayBuffer()
-        )
-      );
-    } catch (error) {
-      window.log.warn(
-        `decryptGroupChange/${logId}: Unable to decrypt modifyDisappearingMessagesTimer.timer`,
-        error && error.stack ? error.stack : error
-      );
-      actions.modifyDisappearingMessagesTimer.timer = undefined;
+  // GroupChange.Actions.ModifyDisappearingMessagesTimerAction;
+  if (actions.modifyDisappearingMessagesTimer) {
+    const { timer } = actions.modifyDisappearingMessagesTimer;
+
+    if (Bytes.isNotEmpty(timer)) {
+      try {
+        result.modifyDisappearingMessagesTimer = {
+          timer: Proto.GroupAttributeBlob.decode(
+            decryptGroupBlob(clientZkGroupCipher, timer)
+          ),
+        };
+      } catch (error) {
+        window.log.warn(
+          `decryptGroupChange/${logId}: Unable to decrypt modifyDisappearingMessagesTimer.timer`,
+          error && error.stack ? error.stack : error
+        );
+      }
+    } else {
+      result.modifyDisappearingMessagesTimer = {};
     }
-  } else if (actions.modifyDisappearingMessagesTimer) {
-    actions.modifyDisappearingMessagesTimer.timer = undefined;
   }
 
   // modifyAttributesAccess?:
-  // GroupChangeClass.Actions.ModifyAttributesAccessControlAction;
-  if (
-    actions.modifyAttributesAccess &&
-    !isValidAccess(actions.modifyAttributesAccess.attributesAccess)
-  ) {
-    throw new Error(
+  // GroupChange.Actions.ModifyAttributesAccessControlAction;
+  if (actions.modifyAttributesAccess) {
+    const attributesAccess = dropNull(
+      actions.modifyAttributesAccess.attributesAccess
+    );
+    strictAssert(
+      isValidAccess(attributesAccess),
       `decryptGroupChange: modifyAttributesAccess.attributesAccess was not valid: ${actions.modifyAttributesAccess.attributesAccess}`
     );
+
+    result.modifyAttributesAccess = {
+      attributesAccess,
+    };
   }
 
-  // modifyMemberAccess?: GroupChangeClass.Actions.ModifyMembersAccessControlAction;
-  if (
-    actions.modifyMemberAccess &&
-    !isValidAccess(actions.modifyMemberAccess.membersAccess)
-  ) {
-    throw new Error(
+  // modifyMemberAccess?: GroupChange.Actions.ModifyMembersAccessControlAction;
+  if (actions.modifyMemberAccess) {
+    const membersAccess = dropNull(actions.modifyMemberAccess.membersAccess);
+    strictAssert(
+      isValidAccess(membersAccess),
       `decryptGroupChange: modifyMemberAccess.membersAccess was not valid: ${actions.modifyMemberAccess.membersAccess}`
     );
+
+    result.modifyMemberAccess = {
+      membersAccess,
+    };
   }
 
   // modifyAddFromInviteLinkAccess?:
-  //   GroupChangeClass.Actions.ModifyAddFromInviteLinkAccessControlAction;
-  if (
-    actions.modifyAddFromInviteLinkAccess &&
-    !isValidLinkAccess(
+  //   GroupChange.Actions.ModifyAddFromInviteLinkAccessControlAction;
+  if (actions.modifyAddFromInviteLinkAccess) {
+    const addFromInviteLinkAccess = dropNull(
       actions.modifyAddFromInviteLinkAccess.addFromInviteLinkAccess
-    )
-  ) {
-    throw new Error(
+    );
+    strictAssert(
+      isValidLinkAccess(addFromInviteLinkAccess),
       `decryptGroupChange: modifyAddFromInviteLinkAccess.addFromInviteLinkAccess was not valid: ${actions.modifyAddFromInviteLinkAccess.addFromInviteLinkAccess}`
     );
+
+    result.modifyAddFromInviteLinkAccess = {
+      addFromInviteLinkAccess,
+    };
   }
 
   // addMemberPendingAdminApprovals?: Array<
-  //   GroupChangeClass.Actions.AddMemberPendingAdminApprovalAction
+  //   GroupChange.Actions.AddMemberPendingAdminApprovalAction
   // >;
-  actions.addMemberPendingAdminApprovals = compact(
+  result.addMemberPendingAdminApprovals = compact(
     (actions.addMemberPendingAdminApprovals || []).map(
       addPendingAdminApproval => {
-        if (addPendingAdminApproval.added) {
-          const decrypted = decryptMemberPendingAdminApproval(
-            clientZkGroupCipher,
-            addPendingAdminApproval.added,
-            logId
-          );
-          if (!decrypted) {
-            window.log.warn(
-              `decryptGroupChange/${logId}: Unable to decrypt addPendingAdminApproval.added. Dropping member.`
-            );
-            return null;
-          }
-
-          addPendingAdminApproval.added = decrypted;
-          return addPendingAdminApproval;
-        }
-        throw new Error(
+        const { added } = addPendingAdminApproval;
+        strictAssert(
+          added,
           'decryptGroupChange: addPendingAdminApproval was missing added field!'
         );
+
+        const decrypted = decryptMemberPendingAdminApproval(
+          clientZkGroupCipher,
+          added,
+          logId
+        );
+        if (!decrypted) {
+          window.log.warn(
+            `decryptGroupChange/${logId}: Unable to decrypt addPendingAdminApproval.added. Dropping member.`
+          );
+          return null;
+        }
+
+        return { added: decrypted };
       }
     )
   );
 
   // deleteMemberPendingAdminApprovals?: Array<
-  //   GroupChangeClass.Actions.DeleteMemberPendingAdminApprovalAction
+  //   GroupChange.Actions.DeleteMemberPendingAdminApprovalAction
   // >;
-  actions.deleteMemberPendingAdminApprovals = compact(
+  result.deleteMemberPendingAdminApprovals = compact(
     (actions.deleteMemberPendingAdminApprovals || []).map(
       deletePendingApproval => {
-        if (hasData(deletePendingApproval.deletedUserId)) {
-          try {
-            deletePendingApproval.deletedUserId = decryptUuid(
-              clientZkGroupCipher,
-              deletePendingApproval.deletedUserId.toArrayBuffer()
-            );
-          } catch (error) {
-            window.log.warn(
-              `decryptGroupChange/${logId}: Unable to decrypt deletePendingApproval.deletedUserId. Dropping member.`,
-              error && error.stack ? error.stack : error
-            );
-            return null;
-          }
-        } else {
-          throw new Error(
-            'decryptGroupChange: deletePendingApproval.deletedUserId was missing'
-          );
-        }
-
-        window.normalizeUuids(
-          deletePendingApproval,
-          ['deletedUserId'],
-          'groups.decryptGroupChange'
+        const { deletedUserId } = deletePendingApproval;
+        strictAssert(
+          Bytes.isNotEmpty(deletedUserId),
+          'decryptGroupChange: deletePendingApproval.deletedUserId was missing'
         );
 
-        if (!window.isValidGuid(deletePendingApproval.deletedUserId)) {
+        let userId: string;
+        try {
+          userId = normalizeUuid(
+            decryptUuid(clientZkGroupCipher, deletedUserId),
+            'actions.deleteMemberPendingAdminApprovals'
+          );
+        } catch (error) {
+          window.log.warn(
+            `decryptGroupChange/${logId}: Unable to decrypt deletePendingApproval.deletedUserId. Dropping member.`,
+            error && error.stack ? error.stack : error
+          );
+          return null;
+        }
+        if (!window.isValidGuid(userId)) {
           window.log.warn(
             `decryptGroupChange/${logId}: Dropping deletePendingApproval due to invalid deletedUserId`
           );
@@ -5086,114 +5357,176 @@ function decryptGroupChange(
           return null;
         }
 
-        return deletePendingApproval;
+        return { deletedUserId: userId };
       }
     )
   );
 
   // promoteMemberPendingAdminApprovals?: Array<
-  //   GroupChangeClass.Actions.PromoteMemberPendingAdminApprovalAction
+  //   GroupChange.Actions.PromoteMemberPendingAdminApprovalAction
   // >;
-  actions.promoteMemberPendingAdminApprovals = compact(
+  result.promoteMemberPendingAdminApprovals = compact(
     (actions.promoteMemberPendingAdminApprovals || []).map(
       promoteAdminApproval => {
-        if (hasData(promoteAdminApproval.userId)) {
-          try {
-            promoteAdminApproval.userId = decryptUuid(
-              clientZkGroupCipher,
-              promoteAdminApproval.userId.toArrayBuffer()
-            );
-          } catch (error) {
-            window.log.warn(
-              `decryptGroupChange/${logId}: Unable to decrypt promoteAdminApproval.userId. Dropping member.`,
-              error && error.stack ? error.stack : error
-            );
-            return null;
-          }
-        } else {
-          throw new Error(
-            'decryptGroupChange: promoteAdminApproval.userId was missing'
+        const { userId } = promoteAdminApproval;
+        strictAssert(
+          Bytes.isNotEmpty(userId),
+          'decryptGroupChange: promoteAdminApproval.userId was missing'
+        );
+
+        let decryptedUserId: string;
+        try {
+          decryptedUserId = normalizeUuid(
+            decryptUuid(clientZkGroupCipher, userId),
+            'actions.promoteMemberPendingAdminApprovals.userId'
           );
+        } catch (error) {
+          window.log.warn(
+            `decryptGroupChange/${logId}: Unable to decrypt promoteAdminApproval.userId. Dropping member.`,
+            error && error.stack ? error.stack : error
+          );
+          return null;
         }
 
-        if (!isValidRole(promoteAdminApproval.role)) {
+        const role = dropNull(promoteAdminApproval.role);
+        if (!isValidRole(role)) {
           throw new Error(
             `decryptGroupChange: promoteAdminApproval had invalid role ${promoteAdminApproval.role}`
           );
         }
 
-        return promoteAdminApproval;
+        return { role, userId: decryptedUserId };
       }
     )
   );
 
-  // modifyInviteLinkPassword?: GroupChangeClass.Actions.ModifyInviteLinkPasswordAction;
-  if (
-    actions.modifyInviteLinkPassword &&
-    hasData(actions.modifyInviteLinkPassword.inviteLinkPassword)
-  ) {
-    actions.modifyInviteLinkPassword.inviteLinkPassword = actions.modifyInviteLinkPassword.inviteLinkPassword.toString(
-      'base64'
-    );
-  } else {
-    actions.modifyInviteLinkPassword = undefined;
+  // modifyInviteLinkPassword?: GroupChange.Actions.ModifyInviteLinkPasswordAction;
+  if (actions.modifyInviteLinkPassword) {
+    const { inviteLinkPassword: password } = actions.modifyInviteLinkPassword;
+    if (Bytes.isNotEmpty(password)) {
+      result.modifyInviteLinkPassword = {
+        inviteLinkPassword: Bytes.toBase64(password),
+      };
+    } else {
+      result.modifyInviteLinkPassword = {};
+    }
   }
 
-  return actions;
+  // modifyDescription?: GroupChange.Actions.ModifyDescriptionAction;
+  if (actions.modifyDescription) {
+    const { descriptionBytes } = actions.modifyDescription;
+    if (Bytes.isNotEmpty(descriptionBytes)) {
+      try {
+        result.modifyDescription = {
+          descriptionBytes: Proto.GroupAttributeBlob.decode(
+            decryptGroupBlob(clientZkGroupCipher, descriptionBytes)
+          ),
+        };
+      } catch (error) {
+        window.log.warn(
+          `decryptGroupChange/${logId}: Unable to decrypt modifyDescription.descriptionBytes`,
+          error && error.stack ? error.stack : error
+        );
+      }
+    } else {
+      result.modifyDescription = {};
+    }
+  }
+
+  return result;
 }
 
 export function decryptGroupTitle(
-  title: ProtoBinaryType,
+  title: Uint8Array | undefined,
   secretParams: string
 ): string | undefined {
   const clientZkGroupCipher = getClientZkGroupCipher(secretParams);
-  if (hasData(title)) {
-    const blob = window.textsecure.protobuf.GroupAttributeBlob.decode(
-      decryptGroupBlob(clientZkGroupCipher, title.toArrayBuffer())
-    );
+  if (!title || !title.length) {
+    return undefined;
+  }
+  const blob = Proto.GroupAttributeBlob.decode(
+    decryptGroupBlob(clientZkGroupCipher, title)
+  );
 
-    if (blob && blob.content === 'title') {
-      return blob.title;
-    }
+  if (blob && blob.content === 'title') {
+    return blob.title;
   }
 
   return undefined;
 }
 
+export function decryptGroupDescription(
+  description: Uint8Array | undefined,
+  secretParams: string
+): string | undefined {
+  const clientZkGroupCipher = getClientZkGroupCipher(secretParams);
+  if (!description || !description.length) {
+    return undefined;
+  }
+
+  const blob = Proto.GroupAttributeBlob.decode(
+    decryptGroupBlob(clientZkGroupCipher, description)
+  );
+
+  if (blob && blob.content === 'descriptionText') {
+    return blob.descriptionText;
+  }
+
+  return undefined;
+}
+
+type DecryptedGroupState = {
+  title?: Proto.GroupAttributeBlob;
+  disappearingMessagesTimer?: Proto.GroupAttributeBlob;
+  accessControl?: {
+    attributes: number;
+    members: number;
+    addFromInviteLink: number;
+  };
+  version?: number;
+  members?: ReadonlyArray<DecryptedMember>;
+  membersPendingProfileKey?: ReadonlyArray<DecryptedMemberPendingProfileKey>;
+  membersPendingAdminApproval?: ReadonlyArray<DecryptedMemberPendingAdminApproval>;
+  inviteLinkPassword?: string;
+  descriptionBytes?: Proto.GroupAttributeBlob;
+  avatar?: string;
+};
+
 function decryptGroupState(
-  groupState: GroupClass,
+  groupState: Readonly<Proto.IGroup>,
   groupSecretParams: string,
   logId: string
-): GroupClass {
+): DecryptedGroupState {
   const clientZkGroupCipher = getClientZkGroupCipher(groupSecretParams);
+  const result: DecryptedGroupState = {};
 
   // title
-  if (hasData(groupState.title)) {
+  if (Bytes.isNotEmpty(groupState.title)) {
     try {
-      groupState.title = window.textsecure.protobuf.GroupAttributeBlob.decode(
-        decryptGroupBlob(clientZkGroupCipher, groupState.title.toArrayBuffer())
+      result.title = Proto.GroupAttributeBlob.decode(
+        decryptGroupBlob(clientZkGroupCipher, groupState.title)
       );
     } catch (error) {
       window.log.warn(
         `decryptGroupState/${logId}: Unable to decrypt title. Clearing it.`,
         error && error.stack ? error.stack : error
       );
-      groupState.title = undefined;
     }
-  } else {
-    groupState.title = undefined;
   }
 
   // avatar
   // Note: decryption happens during application of the change, on download of the avatar
 
   // disappearing message timer
-  if (hasData(groupState.disappearingMessagesTimer)) {
+  if (
+    groupState.disappearingMessagesTimer &&
+    groupState.disappearingMessagesTimer.length
+  ) {
     try {
-      groupState.disappearingMessagesTimer = window.textsecure.protobuf.GroupAttributeBlob.decode(
+      result.disappearingMessagesTimer = Proto.GroupAttributeBlob.decode(
         decryptGroupBlob(
           clientZkGroupCipher,
-          groupState.disappearingMessagesTimer.toArrayBuffer()
+          groupState.disappearingMessagesTimer
         )
       );
     } catch (error) {
@@ -5201,40 +5534,49 @@ function decryptGroupState(
         `decryptGroupState/${logId}: Unable to decrypt disappearing message timer. Clearing it.`,
         error && error.stack ? error.stack : error
       );
-      groupState.disappearingMessagesTimer = undefined;
     }
-  } else {
-    groupState.disappearingMessagesTimer = undefined;
   }
 
   // accessControl
-  if (!isValidAccess(groupState.accessControl?.attributes)) {
-    throw new Error(
-      `decryptGroupState: Access control for attributes is invalid: ${groupState.accessControl?.attributes}`
+  {
+    const { accessControl } = groupState;
+    strictAssert(accessControl, 'No accessControl field found');
+
+    const attributes = dropNull(accessControl.attributes);
+    const members = dropNull(accessControl.members);
+    const addFromInviteLink = dropNull(accessControl.addFromInviteLink);
+
+    strictAssert(
+      isValidAccess(attributes),
+      `decryptGroupState: Access control for attributes is invalid: ${attributes}`
     );
-  }
-  if (!isValidAccess(groupState.accessControl?.members)) {
-    throw new Error(
-      `decryptGroupState: Access control for members is invalid: ${groupState.accessControl?.members}`
+    strictAssert(
+      isValidAccess(members),
+      `decryptGroupState: Access control for members is invalid: ${members}`
     );
-  }
-  if (!isValidLinkAccess(groupState.accessControl?.addFromInviteLink)) {
-    throw new Error(
-      `decryptGroupState: Access control for invite link is invalid: ${groupState.accessControl?.addFromInviteLink}`
+    strictAssert(
+      isValidLinkAccess(addFromInviteLink),
+      `decryptGroupState: Access control for invite link is invalid: ${addFromInviteLink}`
     );
+
+    result.accessControl = {
+      attributes,
+      members,
+      addFromInviteLink,
+    };
   }
 
   // version
-  if (!isNumber(groupState.version)) {
-    throw new Error(
-      `decryptGroupState: Expected version to be a number; it was ${groupState.version}`
-    );
-  }
+  strictAssert(
+    isNumber(groupState.version),
+    `decryptGroupState: Expected version to be a number; it was ${groupState.version}`
+  );
+  result.version = groupState.version;
 
   // members
   if (groupState.members) {
-    groupState.members = compact(
-      groupState.members.map((member: MemberClass) =>
+    result.members = compact(
+      groupState.members.map((member: Proto.IMember) =>
         decryptMember(clientZkGroupCipher, member, logId)
       )
     );
@@ -5242,9 +5584,9 @@ function decryptGroupState(
 
   // membersPendingProfileKey
   if (groupState.membersPendingProfileKey) {
-    groupState.membersPendingProfileKey = compact(
+    result.membersPendingProfileKey = compact(
       groupState.membersPendingProfileKey.map(
-        (member: MemberPendingProfileKeyClass) =>
+        (member: Proto.IMemberPendingProfileKey) =>
           decryptMemberPendingProfileKey(clientZkGroupCipher, member, logId)
       )
     );
@@ -5252,272 +5594,313 @@ function decryptGroupState(
 
   // membersPendingAdminApproval
   if (groupState.membersPendingAdminApproval) {
-    groupState.membersPendingAdminApproval = compact(
+    result.membersPendingAdminApproval = compact(
       groupState.membersPendingAdminApproval.map(
-        (member: MemberPendingAdminApprovalClass) =>
+        (member: Proto.IMemberPendingAdminApproval) =>
           decryptMemberPendingAdminApproval(clientZkGroupCipher, member, logId)
       )
     );
   }
 
   // inviteLinkPassword
-  if (hasData(groupState.inviteLinkPassword)) {
-    groupState.inviteLinkPassword = groupState.inviteLinkPassword.toString(
-      'base64'
-    );
-  } else {
-    groupState.inviteLinkPassword = undefined;
+  if (Bytes.isNotEmpty(groupState.inviteLinkPassword)) {
+    result.inviteLinkPassword = Bytes.toBase64(groupState.inviteLinkPassword);
   }
 
-  return groupState;
+  // descriptionBytes
+  if (Bytes.isNotEmpty(groupState.descriptionBytes)) {
+    try {
+      result.descriptionBytes = Proto.GroupAttributeBlob.decode(
+        decryptGroupBlob(clientZkGroupCipher, groupState.descriptionBytes)
+      );
+    } catch (error) {
+      window.log.warn(
+        `decryptGroupState/${logId}: Unable to decrypt descriptionBytes. Clearing it.`,
+        error && error.stack ? error.stack : error
+      );
+    }
+  }
+
+  result.avatar = dropNull(groupState.avatar);
+
+  return result;
 }
+
+type DecryptedMember = Readonly<{
+  userId: string;
+  profileKey: Uint8Array;
+  role: Proto.Member.Role;
+  joinedAtVersion?: number;
+}>;
 
 function decryptMember(
   clientZkGroupCipher: ClientZkGroupCipher,
-  member: MemberClass,
+  member: Readonly<Proto.IMember>,
   logId: string
-) {
+): DecryptedMember | undefined {
   // userId
-  if (hasData(member.userId)) {
-    try {
-      member.userId = decryptUuid(
-        clientZkGroupCipher,
-        member.userId.toArrayBuffer()
-      );
-    } catch (error) {
-      window.log.warn(
-        `decryptMember/${logId}: Unable to decrypt member userid. Dropping member.`,
-        error && error.stack ? error.stack : error
-      );
-      return null;
-    }
+  strictAssert(
+    Bytes.isNotEmpty(member.userId),
+    'decryptMember: Member had missing userId'
+  );
 
-    window.normalizeUuids(member, ['userId'], 'groups.decryptMember');
+  let userId: string;
+  try {
+    userId = normalizeUuid(
+      decryptUuid(clientZkGroupCipher, member.userId),
+      'decryptMember.userId'
+    );
+  } catch (error) {
+    window.log.warn(
+      `decryptMember/${logId}: Unable to decrypt member userid. Dropping member.`,
+      error && error.stack ? error.stack : error
+    );
+    return undefined;
+  }
 
-    if (!window.isValidGuid(member.userId)) {
-      window.log.warn(
-        `decryptMember/${logId}: Dropping member due to invalid userId`
-      );
+  if (!window.isValidGuid(userId)) {
+    window.log.warn(
+      `decryptMember/${logId}: Dropping member due to invalid userId`
+    );
 
-      return null;
-    }
-  } else {
-    throw new Error('decryptMember: Member had missing userId');
+    return undefined;
   }
 
   // profileKey
-  if (hasData(member.profileKey)) {
-    member.profileKey = decryptProfileKey(
-      clientZkGroupCipher,
-      member.profileKey.toArrayBuffer(),
-      member.userId
-    );
+  strictAssert(
+    Bytes.isNotEmpty(member.profileKey),
+    'decryptMember: Member had missing profileKey'
+  );
+  const profileKey = decryptProfileKey(
+    clientZkGroupCipher,
+    member.profileKey,
+    userId
+  );
 
-    if (!isValidProfileKey(member.profileKey)) {
-      throw new Error('decryptMember: Member had invalid profileKey');
-    }
-  } else {
-    throw new Error('decryptMember: Member had missing profileKey');
+  if (!isValidProfileKey(profileKey)) {
+    throw new Error('decryptMember: Member had invalid profileKey');
   }
 
   // role
-  if (!isValidRole(member.role)) {
+  const role = dropNull(member.role);
+
+  if (!isValidRole(role)) {
     throw new Error(`decryptMember: Member had invalid role ${member.role}`);
   }
 
-  return member;
+  return {
+    userId,
+    profileKey,
+    role,
+    joinedAtVersion: dropNull(member.joinedAtVersion),
+  };
 }
+
+type DecryptedMemberPendingProfileKey = {
+  addedByUserId: string;
+  timestamp: number;
+  member: {
+    userId: string;
+    profileKey?: Uint8Array;
+    role?: Proto.Member.Role;
+  };
+};
 
 function decryptMemberPendingProfileKey(
   clientZkGroupCipher: ClientZkGroupCipher,
-  member: MemberPendingProfileKeyClass,
+  member: Readonly<Proto.IMemberPendingProfileKey>,
   logId: string
-) {
+): DecryptedMemberPendingProfileKey | undefined {
   // addedByUserId
-  if (hasData(member.addedByUserId)) {
-    try {
-      member.addedByUserId = decryptUuid(
-        clientZkGroupCipher,
-        member.addedByUserId.toArrayBuffer()
-      );
-    } catch (error) {
-      window.log.warn(
-        `decryptMemberPendingProfileKey/${logId}: Unable to decrypt pending member addedByUserId. Dropping member.`,
-        error && error.stack ? error.stack : error
-      );
-      return null;
-    }
+  strictAssert(
+    Bytes.isNotEmpty(member.addedByUserId),
+    'decryptMemberPendingProfileKey: Member had missing addedByUserId'
+  );
 
-    window.normalizeUuids(
-      member,
-      ['addedByUserId'],
-      'groups.decryptMemberPendingProfileKey'
+  let addedByUserId: string;
+  try {
+    addedByUserId = normalizeUuid(
+      decryptUuid(clientZkGroupCipher, member.addedByUserId),
+      'decryptMemberPendingProfileKey.addedByUserId'
     );
+  } catch (error) {
+    window.log.warn(
+      `decryptMemberPendingProfileKey/${logId}: Unable to decrypt pending member addedByUserId. Dropping member.`,
+      error && error.stack ? error.stack : error
+    );
+    return undefined;
+  }
 
-    if (!window.isValidGuid(member.addedByUserId)) {
-      window.log.warn(
-        `decryptMemberPendingProfileKey/${logId}: Dropping pending member due to invalid addedByUserId`
-      );
-      return null;
-    }
-  } else {
-    throw new Error(
-      'decryptMemberPendingProfileKey: Member had missing addedByUserId'
+  if (!window.isValidGuid(addedByUserId)) {
+    window.log.warn(
+      `decryptMemberPendingProfileKey/${logId}: Dropping pending member due to invalid addedByUserId`
     );
+    return undefined;
   }
 
   // timestamp
-  member.timestamp = normalizeTimestamp(member.timestamp);
+  const timestamp = normalizeTimestamp(member.timestamp);
 
   if (!member.member) {
     window.log.warn(
       `decryptMemberPendingProfileKey/${logId}: Dropping pending member due to missing member details`
     );
 
-    return null;
+    return undefined;
   }
 
-  const { userId, profileKey, role } = member.member;
+  const { userId, profileKey } = member.member;
 
   // userId
-  if (hasData(userId)) {
-    try {
-      member.member.userId = decryptUuid(
-        clientZkGroupCipher,
-        userId.toArrayBuffer()
-      );
-    } catch (error) {
-      window.log.warn(
-        `decryptMemberPendingProfileKey/${logId}: Unable to decrypt pending member userId. Dropping member.`,
-        error && error.stack ? error.stack : error
-      );
-      return null;
-    }
+  strictAssert(
+    Bytes.isNotEmpty(userId),
+    'decryptMemberPendingProfileKey: Member had missing member.userId'
+  );
 
-    window.normalizeUuids(
-      member.member,
-      ['userId'],
-      'groups.decryptMemberPendingProfileKey'
+  let decryptedUserId: string;
+  try {
+    decryptedUserId = normalizeUuid(
+      decryptUuid(clientZkGroupCipher, userId),
+      'decryptMemberPendingProfileKey.member.userId'
+    );
+  } catch (error) {
+    window.log.warn(
+      `decryptMemberPendingProfileKey/${logId}: Unable to decrypt pending member userId. Dropping member.`,
+      error && error.stack ? error.stack : error
+    );
+    return undefined;
+  }
+
+  if (!window.isValidGuid(decryptedUserId)) {
+    window.log.warn(
+      `decryptMemberPendingProfileKey/${logId}: Dropping pending member due to invalid member.userId`
     );
 
-    if (!window.isValidGuid(member.member.userId)) {
-      window.log.warn(
-        `decryptMemberPendingProfileKey/${logId}: Dropping pending member due to invalid member.userId`
-      );
-
-      return null;
-    }
-  } else {
-    throw new Error(
-      'decryptMemberPendingProfileKey: Member had missing member.userId'
-    );
+    return undefined;
   }
 
   // profileKey
-  if (hasData(profileKey)) {
+  let decryptedProfileKey: Uint8Array | undefined;
+  if (Bytes.isNotEmpty(profileKey)) {
     try {
-      member.member.profileKey = decryptProfileKey(
+      decryptedProfileKey = decryptProfileKey(
         clientZkGroupCipher,
-        profileKey.toArrayBuffer(),
-        member.member.userId
+        profileKey,
+        decryptedUserId
       );
     } catch (error) {
       window.log.warn(
         `decryptMemberPendingProfileKey/${logId}: Unable to decrypt pending member profileKey. Dropping profileKey.`,
         error && error.stack ? error.stack : error
       );
-      member.member.profileKey = null;
     }
 
-    if (!isValidProfileKey(member.member.profileKey)) {
+    if (!isValidProfileKey(decryptedProfileKey)) {
       window.log.warn(
         `decryptMemberPendingProfileKey/${logId}: Dropping profileKey, since it was invalid`
       );
-
-      member.member.profileKey = null;
+      decryptedProfileKey = undefined;
     }
   }
 
   // role
-  if (!isValidRole(role)) {
-    throw new Error(
-      `decryptMemberPendingProfileKey: Member had invalid role ${role}`
-    );
-  }
+  const role = dropNull(member.member.role);
 
-  return member;
+  strictAssert(
+    isValidRole(role),
+    `decryptMemberPendingProfileKey: Member had invalid role ${role}`
+  );
+
+  return {
+    addedByUserId,
+    timestamp,
+    member: {
+      userId: decryptedUserId,
+      profileKey: decryptedProfileKey,
+      role,
+    },
+  };
 }
+
+type DecryptedMemberPendingAdminApproval = {
+  userId: string;
+  profileKey?: Uint8Array;
+  timestamp: number;
+};
 
 function decryptMemberPendingAdminApproval(
   clientZkGroupCipher: ClientZkGroupCipher,
-  member: MemberPendingAdminApprovalClass,
+  member: Readonly<Proto.IMemberPendingAdminApproval>,
   logId: string
-) {
+): DecryptedMemberPendingAdminApproval | undefined {
   // timestamp
-  member.timestamp = normalizeTimestamp(member.timestamp);
+  const timestamp = normalizeTimestamp(member.timestamp);
 
   const { userId, profileKey } = member;
 
   // userId
-  if (hasData(userId)) {
-    try {
-      member.userId = decryptUuid(clientZkGroupCipher, userId.toArrayBuffer());
-    } catch (error) {
-      window.log.warn(
-        `decryptMemberPendingAdminApproval/${logId}: Unable to decrypt pending member userId. Dropping member.`,
-        error && error.stack ? error.stack : error
-      );
-      return null;
-    }
+  strictAssert(
+    Bytes.isNotEmpty(userId),
+    'decryptMemberPendingAdminApproval: Missing userId'
+  );
 
-    window.normalizeUuids(
-      member,
-      ['userId'],
-      'groups.decryptMemberPendingAdminApproval'
+  let decryptedUserId: string;
+  try {
+    decryptedUserId = normalizeUuid(
+      decryptUuid(clientZkGroupCipher, userId),
+      'decryptMemberPendingAdminApproval.userId'
+    );
+  } catch (error) {
+    window.log.warn(
+      `decryptMemberPendingAdminApproval/${logId}: Unable to decrypt pending member userId. Dropping member.`,
+      error && error.stack ? error.stack : error
+    );
+    return undefined;
+  }
+
+  if (!window.isValidGuid(decryptedUserId)) {
+    window.log.warn(
+      `decryptMemberPendingAdminApproval/${logId}: Invalid userId. Dropping member.`
     );
 
-    if (!window.isValidGuid(member.userId)) {
-      window.log.warn(
-        `decryptMemberPendingAdminApproval/${logId}: Invalid userId. Dropping member.`
-      );
-
-      return null;
-    }
-  } else {
-    throw new Error('decryptMemberPendingAdminApproval: Missing userId');
+    return undefined;
   }
 
   // profileKey
-  if (hasData(profileKey)) {
+  let decryptedProfileKey: Uint8Array | undefined;
+  if (Bytes.isNotEmpty(profileKey)) {
     try {
-      member.profileKey = decryptProfileKey(
+      decryptedProfileKey = decryptProfileKey(
         clientZkGroupCipher,
-        profileKey.toArrayBuffer(),
-        member.userId
+        profileKey,
+        decryptedUserId
       );
     } catch (error) {
       window.log.warn(
         `decryptMemberPendingAdminApproval/${logId}: Unable to decrypt profileKey. Dropping profileKey.`,
         error && error.stack ? error.stack : error
       );
-      member.profileKey = null;
     }
 
-    if (!isValidProfileKey(member.profileKey)) {
+    if (!isValidProfileKey(decryptedProfileKey)) {
       window.log.warn(
         `decryptMemberPendingAdminApproval/${logId}: Dropping profileKey, since it was invalid`
       );
 
-      member.profileKey = null;
+      decryptedProfileKey = undefined;
     }
   }
 
-  return member;
+  return {
+    timestamp,
+    userId: decryptedUserId,
+    profileKey: decryptedProfileKey,
+  };
 }
 
 export function getMembershipList(
   conversationId: string
-): Array<{ uuid: string; uuidCiphertext: ArrayBuffer }> {
+): Array<{ uuid: string; uuidCiphertext: Uint8Array }> {
   const conversation = window.ConversationController.get(conversationId);
   if (!conversation) {
     throw new Error('getMembershipList: cannot find conversation');

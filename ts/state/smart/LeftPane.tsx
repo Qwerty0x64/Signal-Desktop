@@ -3,6 +3,7 @@
 
 import React, { CSSProperties } from 'react';
 import { connect } from 'react-redux';
+import { get } from 'lodash';
 import { mapDispatchToProps } from '../actions';
 import {
   LeftPane,
@@ -16,13 +17,15 @@ import { ComposerStep, OneTimeModalState } from '../ducks/conversations';
 import { getSearchResults, isSearching } from '../selectors/search';
 import { getIntl, getRegionCode } from '../selectors/user';
 import {
-  getCandidateContactsForNewGroup,
+  getFilteredCandidateContactsForNewGroup,
   getCantAddContactForModal,
-  getComposeContacts,
+  getFilteredComposeContacts,
+  getFilteredComposeGroups,
   getComposeGroupAvatar,
   getComposeGroupName,
+  getComposeGroupExpireTimer,
   getComposeSelectedContacts,
-  getComposerContactSearchTerm,
+  getComposerConversationSearchTerm,
   getComposerStep,
   getLeftPaneLists,
   getMaximumGroupSizeModalState,
@@ -40,6 +43,7 @@ import { SmartMessageSearchResult } from './MessageSearchResult';
 import { SmartNetworkStatus } from './NetworkStatus';
 import { SmartRelinkDialog } from './RelinkDialog';
 import { SmartUpdateDialog } from './UpdateDialog';
+import { SmartCaptchaDialog } from './CaptchaDialog';
 
 // Workaround: A react component's required properties are filtering up through connect()
 //   https://github.com/DefinitelyTyped/DefinitelyTyped/issues/31363
@@ -68,6 +72,9 @@ function renderRelinkDialog(): JSX.Element {
 function renderUpdateDialog(): JSX.Element {
   return <SmartUpdateDialog />;
 }
+function renderCaptchaDialog({ onSkip }: { onSkip(): void }): JSX.Element {
+  return <SmartCaptchaDialog onSkip={onSkip} />;
+}
 
 const getModeSpecificProps = (
   state: StateType
@@ -83,8 +90,13 @@ const getModeSpecificProps = (
         };
       }
       if (isSearching(state)) {
+        const primarySendsSms = Boolean(
+          get(state.items, ['primarySendsSms'], false)
+        );
+
         return {
           mode: LeftPaneMode.Search,
+          primarySendsSms,
           ...getSearchResults(state),
         };
       }
@@ -95,21 +107,22 @@ const getModeSpecificProps = (
     case ComposerStep.StartDirectConversation:
       return {
         mode: LeftPaneMode.Compose,
-        composeContacts: getComposeContacts(state),
+        composeContacts: getFilteredComposeContacts(state),
+        composeGroups: getFilteredComposeGroups(state),
         regionCode: getRegionCode(state),
-        searchTerm: getComposerContactSearchTerm(state),
+        searchTerm: getComposerConversationSearchTerm(state),
       };
     case ComposerStep.ChooseGroupMembers:
       return {
         mode: LeftPaneMode.ChooseGroupMembers,
-        candidateContacts: getCandidateContactsForNewGroup(state),
+        candidateContacts: getFilteredCandidateContactsForNewGroup(state),
         cantAddContactForModal: getCantAddContactForModal(state),
         isShowingRecommendedGroupSizeModal:
           getRecommendedGroupSizeModalState(state) ===
           OneTimeModalState.Showing,
         isShowingMaximumGroupSizeModal:
           getMaximumGroupSizeModalState(state) === OneTimeModalState.Showing,
-        searchTerm: getComposerContactSearchTerm(state),
+        searchTerm: getComposerConversationSearchTerm(state),
         selectedContacts: getComposeSelectedContacts(state),
       };
     case ComposerStep.SetGroupMetadata:
@@ -117,6 +130,7 @@ const getModeSpecificProps = (
         mode: LeftPaneMode.SetGroupMetadata,
         groupAvatar: getComposeGroupAvatar(state),
         groupName: getComposeGroupName(state),
+        groupExpireTimer: getComposeGroupExpireTimer(state),
         hasError: hasGroupCreationError(state),
         isCreating: isCreatingGroup(state),
         selectedContacts: getComposeSelectedContacts(state),
@@ -134,12 +148,14 @@ const mapStateToProps = (state: StateType) => {
     showArchived: getShowArchived(state),
     i18n: getIntl(state),
     regionCode: getRegionCode(state),
+    challengeStatus: state.network.challengeStatus,
     renderExpiredBuildDialog,
     renderMainHeader,
     renderMessageSearchResult,
     renderNetworkStatus,
     renderRelinkDialog,
     renderUpdateDialog,
+    renderCaptchaDialog,
   };
 };
 

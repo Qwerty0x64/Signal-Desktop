@@ -12,6 +12,8 @@ import { LocalizerType } from '../types/Util';
 export type Props = {
   readonly i18n: LocalizerType;
 
+  onEditProfile: () => unknown;
+  onSetChatColor: () => unknown;
   onViewPreferences: () => unknown;
   onViewArchive: () => unknown;
 
@@ -28,6 +30,8 @@ export const AvatarPopup = (props: Props): JSX.Element => {
     profileName,
     phoneNumber,
     title,
+    onEditProfile,
+    onSetChatColor,
     onViewPreferences,
     onViewArchive,
     style,
@@ -42,7 +46,12 @@ export const AvatarPopup = (props: Props): JSX.Element => {
 
   return (
     <div style={style} className="module-avatar-popup">
-      <div className="module-avatar-popup__profile">
+      <button
+        className="module-avatar-popup__profile"
+        onClick={onEditProfile}
+        ref={focusRef}
+        type="button"
+      >
         <Avatar {...props} size={52} />
         <div className="module-avatar-popup__profile__text">
           <div className="module-avatar-popup__profile__name">
@@ -54,11 +63,10 @@ export const AvatarPopup = (props: Props): JSX.Element => {
             </div>
           ) : null}
         </div>
-      </div>
+      </button>
       <hr className="module-avatar-popup__divider" />
       <button
         type="button"
-        ref={focusRef}
         className="module-avatar-popup__item"
         onClick={onViewPreferences}
       >
@@ -70,6 +78,21 @@ export const AvatarPopup = (props: Props): JSX.Element => {
         />
         <div className="module-avatar-popup__item__text">
           {i18n('mainMenuSettings')}
+        </div>
+      </button>
+      <button
+        type="button"
+        className="module-avatar-popup__item"
+        onClick={onSetChatColor}
+      >
+        <div
+          className={classNames(
+            'module-avatar-popup__item__icon',
+            'module-avatar-popup__item__icon-colors'
+          )}
+        />
+        <div className="module-avatar-popup__item__text">
+          {i18n('avatarMenuChatColors')}
         </div>
       </button>
       <button

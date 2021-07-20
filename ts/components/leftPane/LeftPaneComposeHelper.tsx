@@ -7,6 +7,8 @@ import { PhoneNumber } from 'google-libphonenumber';
 import { LeftPaneHelper } from './LeftPaneHelper';
 import { Row, RowType } from '../ConversationList';
 import { PropsDataType as ContactListItemPropsType } from '../conversationList/ContactListItem';
+import { PropsData as ConversationListItemPropsType } from '../conversationList/ConversationListItem';
+import { SearchInput } from '../SearchInput';
 import { LocalizerType } from '../../types/Util';
 import {
   instance as phoneNumberInstance,
@@ -18,6 +20,7 @@ import { isStorageWriteFeatureEnabled } from '../../storage/isFeatureEnabled';
 
 export type LeftPaneComposePropsType = {
   composeContacts: ReadonlyArray<ContactListItemPropsType>;
+  composeGroups: ReadonlyArray<ContactListItemPropsType>;
   regionCode: string;
   searchTerm: string;
 };
@@ -30,10 +33,10 @@ enum TopButton {
 
 /* eslint-disable class-methods-use-this */
 
-export class LeftPaneComposeHelper extends LeftPaneHelper<
-  LeftPaneComposePropsType
-> {
+export class LeftPaneComposeHelper extends LeftPaneHelper<LeftPaneComposePropsType> {
   private readonly composeContacts: ReadonlyArray<ContactListItemPropsType>;
+
+  private readonly composeGroups: ReadonlyArray<ConversationListItemPropsType>;
 
   private readonly searchTerm: string;
 
@@ -41,14 +44,16 @@ export class LeftPaneComposeHelper extends LeftPaneHelper<
 
   constructor({
     composeContacts,
+    composeGroups,
     regionCode,
     searchTerm,
   }: Readonly<LeftPaneComposePropsType>) {
     super();
 
-    this.composeContacts = composeContacts;
     this.searchTerm = searchTerm;
     this.phoneNumber = parsePhoneNumber(searchTerm, regionCode);
+    this.composeGroups = composeGroups;
+    this.composeContacts = composeContacts;
   }
 
   getHeaderContents({
@@ -89,21 +94,17 @@ export class LeftPaneComposeHelper extends LeftPaneHelper<
   }>): ReactChild {
     return (
       <>
-        <div className="module-left-pane__compose-search-form">
-          <input
-            type="text"
-            ref={focusRef}
-            className="module-left-pane__compose-search-form__input"
-            placeholder={i18n('contactSearchPlaceholder')}
-            dir="auto"
-            value={this.searchTerm}
-            onChange={onChangeComposeSearchTerm}
-          />
-        </div>
+        <SearchInput
+          moduleClassName="module-left-pane__compose-search-form"
+          onChange={onChangeComposeSearchTerm}
+          placeholder={i18n('contactSearchPlaceholder')}
+          ref={focusRef}
+          value={this.searchTerm}
+        />
 
         {this.getRowCount() ? null : (
           <div className="module-left-pane__compose-no-contacts">
-            {i18n('noContactsFound')}
+            {i18n('noConversationsFound')}
           </div>
         )}
       </>
@@ -111,62 +112,89 @@ export class LeftPaneComposeHelper extends LeftPaneHelper<
   }
 
   getRowCount(): number {
-    let result = this.composeContacts.length;
+    let result = this.composeContacts.length + this.composeGroups.length;
     if (this.hasTopButton()) {
       result += 1;
     }
     if (this.hasContactsHeader()) {
       result += 1;
     }
+    if (this.hasGroupsHeader()) {
+      result += 1;
+    }
+
     return result;
   }
 
-  getRow(rowIndex: number): undefined | Row {
-    if (rowIndex === 0) {
-      const topButton = this.getTopButton();
-      switch (topButton) {
-        case TopButton.None:
-          break;
-        case TopButton.StartNewConversation:
-          assert(
-            this.phoneNumber,
-            'LeftPaneComposeHelper: we should have a phone number if the top button is "Start new conversation"'
-          );
-          return {
-            type: RowType.StartNewConversation,
-            phoneNumber: phoneNumberInstance.format(
+  getRow(actualRowIndex: number): undefined | Row {
+    let virtualRowIndex = actualRowIndex;
+    if (this.hasTopButton()) {
+      if (virtualRowIndex === 0) {
+        const topButton = this.getTopButton();
+        switch (topButton) {
+          case TopButton.None:
+            break;
+          case TopButton.StartNewConversation:
+            assert(
               this.phoneNumber,
-              PhoneNumberFormat.E164
-            ),
-          };
-        case TopButton.CreateNewGroup:
-          return { type: RowType.CreateNewGroup };
-        default:
-          throw missingCaseError(topButton);
+              'LeftPaneComposeHelper: we should have a phone number if the top button is "Start new conversation"'
+            );
+            return {
+              type: RowType.StartNewConversation,
+              phoneNumber: phoneNumberInstance.format(
+                this.phoneNumber,
+                PhoneNumberFormat.E164
+              ),
+            };
+          case TopButton.CreateNewGroup:
+            return { type: RowType.CreateNewGroup };
+          default:
+            throw missingCaseError(topButton);
+        }
       }
+
+      virtualRowIndex -= 1;
     }
 
-    if (rowIndex === 1 && this.hasContactsHeader()) {
+    if (this.hasContactsHeader()) {
+      if (virtualRowIndex === 0) {
+        return {
+          type: RowType.Header,
+          i18nKey: 'contactsHeader',
+        };
+      }
+
+      virtualRowIndex -= 1;
+
+      const contact = this.composeContacts[virtualRowIndex];
+      if (contact) {
+        return {
+          type: RowType.Contact,
+          contact,
+        };
+      }
+
+      virtualRowIndex -= this.composeContacts.length;
+    }
+
+    if (this.hasGroupsHeader()) {
+      if (virtualRowIndex === 0) {
+        return {
+          type: RowType.Header,
+          i18nKey: 'groupsHeader',
+        };
+      }
+
+      virtualRowIndex -= 1;
+
+      const group = this.composeGroups[virtualRowIndex];
       return {
-        type: RowType.Header,
-        i18nKey: 'contactsHeader',
+        type: RowType.Conversation,
+        conversation: group,
       };
     }
 
-    let contactIndex: number;
-    if (this.hasTopButton()) {
-      contactIndex = rowIndex - 2;
-    } else {
-      contactIndex = rowIndex;
-    }
-
-    const contact = this.composeContacts[contactIndex];
-    return contact
-      ? {
-          type: RowType.Contact,
-          contact,
-        }
-      : undefined;
+    return undefined;
   }
 
   // This is deliberately unimplemented because these keyboard shortcuts shouldn't work in
@@ -183,10 +211,17 @@ export class LeftPaneComposeHelper extends LeftPaneHelper<
     return undefined;
   }
 
-  shouldRecomputeRowHeights(old: Readonly<LeftPaneComposePropsType>): boolean {
+  shouldRecomputeRowHeights(
+    exProps: Readonly<LeftPaneComposePropsType>
+  ): boolean {
+    const prev = new LeftPaneComposeHelper(exProps);
+    const currHeaderIndices = this.getHeaderIndices();
+    const prevHeaderIndices = prev.getHeaderIndices();
+
     return (
-      this.hasContactsHeader() !==
-      new LeftPaneComposeHelper(old).hasContactsHeader()
+      currHeaderIndices.top !== prevHeaderIndices.top ||
+      currHeaderIndices.contact !== prevHeaderIndices.contact ||
+      currHeaderIndices.group !== prevHeaderIndices.group
     );
   }
 
@@ -205,7 +240,39 @@ export class LeftPaneComposeHelper extends LeftPaneHelper<
   }
 
   private hasContactsHeader(): boolean {
-    return this.hasTopButton() && Boolean(this.composeContacts.length);
+    return Boolean(this.composeContacts.length);
+  }
+
+  private hasGroupsHeader(): boolean {
+    return Boolean(this.composeGroups.length);
+  }
+
+  private getHeaderIndices(): {
+    top?: number;
+    contact?: number;
+    group?: number;
+  } {
+    let top: number | undefined;
+    let contact: number | undefined;
+    let group: number | undefined;
+    let rowCount = 0;
+    if (this.hasTopButton()) {
+      top = 0;
+      rowCount += 1;
+    }
+    if (this.composeContacts.length) {
+      contact = rowCount;
+      rowCount += this.composeContacts.length;
+    }
+    if (this.composeGroups.length) {
+      group = rowCount;
+    }
+
+    return {
+      top,
+      contact,
+      group,
+    };
   }
 }
 

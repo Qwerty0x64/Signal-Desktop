@@ -3,9 +3,9 @@
 
 // The idea with this file is to make it webpackable for the style guide
 
-const { bindActionCreators } = require('redux');
 const Backbone = require('../../ts/backbone');
 const Crypto = require('../../ts/Crypto');
+const Curve = require('../../ts/Curve');
 const {
   start: conversationControllerStart,
 } = require('../../ts/ConversationController');
@@ -17,19 +17,20 @@ const GroupChange = require('../../ts/groupChange');
 const IndexedDB = require('./indexeddb');
 const Notifications = require('../../ts/notifications');
 const OS = require('../../ts/OS');
-const Stickers = require('./stickers');
+const Stickers = require('../../ts/types/Stickers');
 const Settings = require('./settings');
 const RemoteConfig = require('../../ts/RemoteConfig');
 const Util = require('../../ts/util');
-const LinkPreviews = require('./link_previews');
-const AttachmentDownloads = require('./attachment_downloads');
 
 // Components
 const {
   AttachmentList,
 } = require('../../ts/components/conversation/AttachmentList');
 const { CaptionEditor } = require('../../ts/components/CaptionEditor');
-const { ConfirmationModal } = require('../../ts/components/ConfirmationModal');
+const { ChatColorPicker } = require('../../ts/components/ChatColorPicker');
+const {
+  ConfirmationDialog,
+} = require('../../ts/components/ConfirmationDialog');
 const {
   ContactDetail,
 } = require('../../ts/components/conversation/ContactDetail');
@@ -50,14 +51,20 @@ const {
 const { Quote } = require('../../ts/components/conversation/Quote');
 const { ProgressModal } = require('../../ts/components/ProgressModal');
 const {
-  SafetyNumberChangeDialog,
-} = require('../../ts/components/SafetyNumberChangeDialog');
-const {
   StagedLinkPreview,
 } = require('../../ts/components/conversation/StagedLinkPreview');
+const {
+  DisappearingTimeDialog,
+} = require('../../ts/components/DisappearingTimeDialog');
+const {
+  SystemTraySettingsCheckboxes,
+} = require('../../ts/components/conversation/SystemTraySettingsCheckboxes');
 
 // State
 const { createTimeline } = require('../../ts/state/roots/createTimeline');
+const {
+  createChatColorPicker,
+} = require('../../ts/state/roots/createChatColorPicker');
 const {
   createCompositionArea,
 } = require('../../ts/state/roots/createCompositionArea');
@@ -70,7 +77,10 @@ const {
 const {
   createConversationHeader,
 } = require('../../ts/state/roots/createConversationHeader');
-const { createCallManager } = require('../../ts/state/roots/createCallManager');
+const { createApp } = require('../../ts/state/roots/createApp');
+const {
+  createForwardMessageModal,
+} = require('../../ts/state/roots/createForwardMessageModal');
 const {
   createGroupLinkManagement,
 } = require('../../ts/state/roots/createGroupLinkManagement');
@@ -104,11 +114,13 @@ const {
 } = require('../../ts/state/roots/createShortcutGuideModal');
 
 const { createStore } = require('../../ts/state/createStore');
+const appDuck = require('../../ts/state/ducks/app');
 const callingDuck = require('../../ts/state/ducks/calling');
 const conversationsDuck = require('../../ts/state/ducks/conversations');
 const emojisDuck = require('../../ts/state/ducks/emojis');
 const expirationDuck = require('../../ts/state/ducks/expiration');
 const itemsDuck = require('../../ts/state/ducks/items');
+const linkPreviewsDuck = require('../../ts/state/ducks/linkPreviews');
 const networkDuck = require('../../ts/state/ducks/network');
 const searchDuck = require('../../ts/state/ducks/search');
 const stickersDuck = require('../../ts/state/ducks/stickers');
@@ -119,15 +131,14 @@ const conversationsSelectors = require('../../ts/state/selectors/conversations')
 const searchSelectors = require('../../ts/state/selectors/search');
 
 // Types
-const AttachmentType = require('./types/attachment');
+const AttachmentType = require('../../ts/types/Attachment');
 const VisualAttachment = require('./types/visual_attachment');
 const Contact = require('../../ts/types/Contact');
 const Conversation = require('./types/conversation');
-const Errors = require('./types/errors');
+const Errors = require('../../ts/types/errors');
 const MediaGalleryMessage = require('../../ts/components/conversation/media-gallery/types/Message');
 const MessageType = require('./types/message');
 const MIME = require('../../ts/types/MIME');
-const PhoneNumber = require('../../ts/types/PhoneNumber');
 const SettingsType = require('../../ts/types/Settings');
 
 // Views
@@ -317,7 +328,8 @@ exports.setup = (options = {}) => {
   const Components = {
     AttachmentList,
     CaptionEditor,
-    ConfirmationModal,
+    ChatColorPicker,
+    ConfirmationDialog,
     ContactDetail,
     ContactListItem,
     ContactModal,
@@ -329,19 +341,22 @@ exports.setup = (options = {}) => {
     MessageDetail,
     Quote,
     ProgressModal,
-    SafetyNumberChangeDialog,
     StagedLinkPreview,
+    DisappearingTimeDialog,
+    SystemTraySettingsCheckboxes,
     Types: {
       Message: MediaGalleryMessage,
     },
   };
 
   const Roots = {
-    createCallManager,
+    createApp,
+    createChatColorPicker,
     createCompositionArea,
     createContactModal,
     createConversationDetails,
     createConversationHeader,
+    createForwardMessageModal,
     createGroupLinkManagement,
     createGroupV1MigrationModal,
     createGroupV2JoinModal,
@@ -357,11 +372,13 @@ exports.setup = (options = {}) => {
   };
 
   const Ducks = {
+    app: appDuck,
     calling: callingDuck,
     conversations: conversationsDuck,
     emojis: emojisDuck,
     expiration: expirationDuck,
     items: itemsDuck,
+    linkPreviews: linkPreviewsDuck,
     network: networkDuck,
     updates: updatesDuck,
     user: userDuck,
@@ -389,7 +406,6 @@ exports.setup = (options = {}) => {
   };
 
   const State = {
-    bindActionCreators,
     createStore,
     Roots,
     Ducks,
@@ -403,7 +419,6 @@ exports.setup = (options = {}) => {
     Errors,
     Message: MessageType,
     MIME,
-    PhoneNumber,
     Settings: SettingsType,
     VisualAttachment,
   };
@@ -418,10 +433,10 @@ exports.setup = (options = {}) => {
   };
 
   return {
-    AttachmentDownloads,
     Backbone,
     Components,
     Crypto,
+    Curve,
     conversationControllerStart,
     Data,
     Emojis,
@@ -429,7 +444,6 @@ exports.setup = (options = {}) => {
     Groups,
     GroupChange,
     IndexedDB,
-    LinkPreviews,
     Migrations,
     Notifications,
     OS,

@@ -6,10 +6,10 @@
 window.React = require('react');
 window.ReactDOM = require('react-dom');
 
-const { ipcRenderer, remote } = require('electron');
+const { ipcRenderer } = require('electron');
 const url = require('url');
 const i18n = require('./js/modules/i18n');
-const { ConfirmationModal } = require('./ts/components/ConfirmationModal');
+const { ConfirmationDialog } = require('./ts/components/ConfirmationDialog');
 const { makeGetter, makeSetter } = require('./preload_utils');
 const {
   getEnvironment,
@@ -17,12 +17,14 @@ const {
   parseEnvironment,
 } = require('./ts/environment');
 
-const { nativeTheme } = remote.require('electron');
+const { Context: SignalContext } = require('./ts/context');
 
 const config = url.parse(window.location.toString(), true).query;
 const { locale } = config;
 const localeMessages = ipcRenderer.sendSync('locale-data');
 setEnvironment(parseEnvironment(config.environment));
+
+window.SignalContext = new SignalContext(ipcRenderer);
 
 window.getEnvironment = getEnvironment;
 window.getVersion = () => config.version;
@@ -32,21 +34,8 @@ window.forCalling = config.forCalling === 'true';
 window.forCamera = config.forCamera === 'true';
 window.Signal = {
   Components: {
-    ConfirmationModal,
+    ConfirmationDialog,
   },
-};
-
-function setSystemTheme() {
-  window.systemTheme = nativeTheme.shouldUseDarkColors ? 'dark' : 'light';
-}
-
-setSystemTheme();
-
-window.subscribeToSystemThemeChange = fn => {
-  nativeTheme.on('updated', () => {
-    setSystemTheme();
-    fn();
-  });
 };
 
 require('./ts/logging/set_up_renderer_logging').initialize();

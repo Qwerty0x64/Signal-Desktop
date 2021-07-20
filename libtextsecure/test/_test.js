@@ -5,7 +5,6 @@
 
 mocha.setup('bdd');
 window.assert = chai.assert;
-window.PROTO_ROOT = '../../protos';
 
 const OriginalReporter = mocha._reporter;
 
@@ -60,8 +59,6 @@ window.hexToArrayBuffer = str => {
   return ret;
 };
 
-window.MockSocket.prototype.addEventListener = () => null;
-
 window.Whisper = window.Whisper || {};
 window.Whisper.events = {
   on() {},
@@ -71,7 +68,8 @@ window.Whisper.events = {
 before(async () => {
   try {
     window.log.info('Initializing SQL in renderer');
-    await window.sqlInitializer.initialize();
+    const isTesting = true;
+    await window.sqlInitializer.initialize(isTesting);
     window.log.info('SQL initialized in renderer');
   } catch (err) {
     window.log.error(

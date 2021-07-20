@@ -29,13 +29,11 @@
     events: {
       'click .try-again': 'connect',
       'click .second': 'shutdown',
-      'click .finish': 'finishLinking',
       // the actual next step happens in confirmNumber() on submit form #link-phone
     },
     initialize(options = {}) {
       window.readyForUpdates();
 
-      this.didLink = false;
       this.selectStep(Steps.SCAN_QR_CODE);
       this.connect();
       this.on('disconnected', this.reconnect);
@@ -181,10 +179,6 @@
       this.$(DEVICE_NAME_SELECTOR).val(deviceName || window.getHostName());
       this.$(DEVICE_NAME_SELECTOR).focus();
     },
-    finishLinking() {
-      // We use a form so we get submit-on-enter behavior
-      this.$('#link-phone').submit();
-    },
     confirmNumber() {
       const tsp = textsecure.storage.protocol;
 
@@ -197,7 +191,7 @@
           this.selectStep(Steps.PROGRESS_BAR);
 
           const finish = () => {
-            this.didLink = true;
+            window.Signal.Util.postLinkExperience.start();
             return resolve(name);
           };
 

@@ -11,7 +11,7 @@ import { showSettings } from '../shims/Whisper';
 import { Avatar } from './Avatar';
 import { AvatarPopup } from './AvatarPopup';
 import { LocalizerType } from '../types/Util';
-import { ColorType } from '../types/Colors';
+import { AvatarColorType } from '../types/Colors';
 import { ConversationType } from '../state/ducks/conversations';
 
 export type PropsType = {
@@ -31,7 +31,8 @@ export type PropsType = {
   phoneNumber?: string;
   isMe?: boolean;
   name?: string;
-  color?: ColorType;
+  color?: AvatarColorType;
+  disabled?: boolean;
   isVerified?: boolean;
   profileName?: string;
   title: string;
@@ -63,6 +64,8 @@ export type PropsType = {
 
   showArchivedConversations: () => void;
   startComposing: () => void;
+  toggleChatColorEditor: () => void;
+  toggleProfileEditor: () => void;
 };
 
 type StateType = {
@@ -205,7 +208,7 @@ export class MainHeader extends React.Component<PropsType, StateType> {
       updateSearchTerm(searchTerm);
     }
 
-    if (searchTerm.length < 2) {
+    if (searchTerm.length < 1) {
       return;
     }
 
@@ -339,6 +342,7 @@ export class MainHeader extends React.Component<PropsType, StateType> {
     const {
       avatarPath,
       color,
+      disabled,
       i18n,
       name,
       startComposing,
@@ -349,6 +353,8 @@ export class MainHeader extends React.Component<PropsType, StateType> {
       searchConversationName,
       searchTerm,
       showArchivedConversations,
+      toggleChatColorEditor,
+      toggleProfileEditor,
     } = this.props;
     const { showingAvatarPopup, popperRoot } = this.state;
 
@@ -366,15 +372,20 @@ export class MainHeader extends React.Component<PropsType, StateType> {
           <Reference>
             {({ ref }) => (
               <Avatar
+                acceptedMessageRequest
                 avatarPath={avatarPath}
                 className="module-main-header__avatar"
                 color={color}
                 conversationType="direct"
                 i18n={i18n}
+                isMe
                 name={name}
                 phoneNumber={phoneNumber}
                 profileName={profileName}
                 title={title}
+                // `sharedGroupNames` makes no sense for yourself, but `<Avatar>` needs it
+                //   to determine blurring.
+                sharedGroupNames={[]}
                 size={28}
                 innerRef={ref}
                 onClick={this.showAvatarPopup}
@@ -386,9 +397,11 @@ export class MainHeader extends React.Component<PropsType, StateType> {
                 <Popper placement="bottom-end">
                   {({ ref, style }) => (
                     <AvatarPopup
+                      acceptedMessageRequest
                       innerRef={ref}
                       i18n={i18n}
-                      style={style}
+                      isMe
+                      style={{ ...style, zIndex: 1 }}
                       color={color}
                       conversationType="direct"
                       name={name}
@@ -397,6 +410,16 @@ export class MainHeader extends React.Component<PropsType, StateType> {
                       title={title}
                       avatarPath={avatarPath}
                       size={28}
+                      // See the comment above about `sharedGroupNames`.
+                      sharedGroupNames={[]}
+                      onEditProfile={() => {
+                        toggleProfileEditor();
+                        this.hideAvatarPopup();
+                      }}
+                      onSetChatColor={() => {
+                        toggleChatColorEditor();
+                        this.hideAvatarPopup();
+                      }}
                       onViewPreferences={() => {
                         showSettings();
                         this.hideAvatarPopup();
@@ -436,6 +459,7 @@ export class MainHeader extends React.Component<PropsType, StateType> {
             />
           )}
           <input
+            disabled={disabled}
             type="text"
             ref={this.inputRef}
             className={classNames(

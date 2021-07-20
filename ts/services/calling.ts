@@ -1,8 +1,9 @@
-// Copyright 2020 Signal Messenger, LLC
+// Copyright 2020-2021 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
 /* eslint-disable class-methods-use-this */
 
+import { desktopCapturer, ipcRenderer } from 'electron';
 import {
   Call,
   CallEndedReason,
@@ -21,7 +22,6 @@ import {
   GumVideoCapturer,
   HangupMessage,
   HangupType,
-  OfferType,
   OpaqueMessage,
   PeekInfo,
   RingRTC,
@@ -37,26 +37,33 @@ import {
   GroupCallPeekInfoType,
 } from '../state/ducks/calling';
 import { getConversationCallMode } from '../state/ducks/conversations';
-import { EnvelopeClass } from '../textsecure.d';
 import {
   CallMode,
   AudioDevice,
   MediaDeviceSettings,
   GroupCallConnectionState,
   GroupCallJoinState,
+  PresentableSource,
+  PresentedSource,
 } from '../types/Calling';
+import { LocalizerType } from '../types/Util';
 import { ConversationModel } from '../models/conversations';
+import * as Bytes from '../Bytes';
 import {
-  base64ToArrayBuffer,
   uuidToArrayBuffer,
   arrayBufferToUuid,
+  typedArrayToArrayBuffer,
 } from '../Crypto';
+import { assert } from '../util/assert';
+import { dropNull, shallowDropNull } from '../util/dropNull';
 import { getOwn } from '../util/getOwn';
+import { handleMessageSend } from '../util/handleMessageSend';
 import {
   fetchMembershipProof,
   getMembershipList,
   wrapWithSyncMessageSend,
 } from '../groups';
+import { ProcessedEnvelope } from '../textsecure/Types.d';
 import { missingCaseError } from '../util/missingCaseError';
 import { normalizeGroupCallTimestamp } from '../util/ringrtc/normalizeGroupCallTimestamp';
 import {
@@ -64,6 +71,12 @@ import {
   REQUESTED_VIDEO_HEIGHT,
   REQUESTED_VIDEO_FRAMERATE,
 } from '../calling/constants';
+import { notify } from './notify';
+import { getSendOptions } from '../util/getSendOptions';
+import { SignalService as Proto } from '../protobuf';
+
+// TODO: remove once we move away from ArrayBuffers
+const FIXMEU8 = Uint8Array;
 
 const RINGRTC_HTTP_METHOD_TO_OUR_HTTP_METHOD: Map<
   HttpMethod,
@@ -85,6 +98,162 @@ enum GroupCallUpdateMessageState {
   SentLeft,
 }
 
+function isScreenSource(source: PresentedSource): boolean {
+  return source.id.startsWith('screen');
+}
+
+function translateSourceName(
+  i18n: LocalizerType,
+  source: PresentedSource
+): string {
+  const { name } = source;
+  if (!isScreenSource(source)) {
+    return name;
+  }
+
+  if (name === 'Entire Screen') {
+    return i18n('calling__SelectPresentingSourcesModal--entireScreen');
+  }
+
+  const match = name.match(/^Screen (\d+)$/);
+  if (match) {
+    return i18n('calling__SelectPresentingSourcesModal--screen', {
+      id: match[1],
+    });
+  }
+
+  return name;
+}
+
+function protoToCallingMessage({
+  offer,
+  answer,
+  iceCandidates,
+  legacyHangup,
+  busy,
+  hangup,
+  supportsMultiRing,
+  destinationDeviceId,
+  opaque,
+}: Proto.ICallingMessage): CallingMessage {
+  return {
+    offer: offer
+      ? {
+          ...shallowDropNull(offer),
+
+          type: dropNull(offer.type) as number,
+          opaque: offer.opaque ? Buffer.from(offer.opaque) : undefined,
+        }
+      : undefined,
+    answer: answer
+      ? {
+          ...shallowDropNull(answer),
+          opaque: answer.opaque ? Buffer.from(answer.opaque) : undefined,
+        }
+      : undefined,
+    iceCandidates: iceCandidates
+      ? iceCandidates.map(candidate => {
+          return {
+            ...shallowDropNull(candidate),
+            opaque: candidate.opaque
+              ? Buffer.from(candidate.opaque)
+              : undefined,
+          };
+        })
+      : undefined,
+    legacyHangup: legacyHangup
+      ? {
+          ...shallowDropNull(legacyHangup),
+          type: dropNull(legacyHangup.type) as number,
+        }
+      : undefined,
+    busy: shallowDropNull(busy),
+    hangup: hangup
+      ? {
+          ...shallowDropNull(hangup),
+          type: dropNull(hangup.type) as number,
+        }
+      : undefined,
+    supportsMultiRing: dropNull(supportsMultiRing),
+    destinationDeviceId: dropNull(destinationDeviceId),
+    opaque: opaque
+      ? {
+          data: opaque.data ? Buffer.from(opaque.data) : undefined,
+        }
+      : undefined,
+  };
+}
+
+function bufferToProto(
+  value: Buffer | { toArrayBuffer(): ArrayBuffer } | undefined
+): Uint8Array | undefined {
+  if (!value) {
+    return undefined;
+  }
+  if (value instanceof Uint8Array) {
+    return value;
+  }
+
+  return new FIXMEU8(value.toArrayBuffer());
+}
+
+function callingMessageToProto({
+  offer,
+  answer,
+  iceCandidates,
+  legacyHangup,
+  busy,
+  hangup,
+  supportsMultiRing,
+  destinationDeviceId,
+  opaque,
+}: CallingMessage): Proto.ICallingMessage {
+  return {
+    offer: offer
+      ? {
+          ...offer,
+          type: offer.type as number,
+          opaque: bufferToProto(offer.opaque),
+        }
+      : undefined,
+    answer: answer
+      ? {
+          ...answer,
+          opaque: bufferToProto(answer.opaque),
+        }
+      : undefined,
+    iceCandidates: iceCandidates
+      ? iceCandidates.map(candidate => {
+          return {
+            ...candidate,
+            opaque: bufferToProto(candidate.opaque),
+          };
+        })
+      : undefined,
+    legacyHangup: legacyHangup
+      ? {
+          ...legacyHangup,
+          type: legacyHangup.type as number,
+        }
+      : undefined,
+    busy,
+    hangup: hangup
+      ? {
+          ...hangup,
+          type: hangup.type as number,
+        }
+      : undefined,
+    supportsMultiRing,
+    destinationDeviceId,
+    opaque: opaque
+      ? {
+          ...opaque,
+          data: bufferToProto(opaque.data),
+        }
+      : undefined,
+  };
+}
+
 export class CallingClass {
   readonly videoCapturer: GumVideoCapturer;
 
@@ -100,12 +269,14 @@ export class CallingClass {
 
   private callsByConversation: { [conversationId: string]: Call | GroupCall };
 
+  private hadLocalVideoBeforePresenting?: boolean;
+
   constructor() {
-    this.videoCapturer = new GumVideoCapturer(
-      REQUESTED_VIDEO_WIDTH,
-      REQUESTED_VIDEO_HEIGHT,
-      REQUESTED_VIDEO_FRAMERATE
-    );
+    this.videoCapturer = new GumVideoCapturer({
+      maxWidth: REQUESTED_VIDEO_WIDTH,
+      maxHeight: REQUESTED_VIDEO_HEIGHT,
+      maxFramerate: REQUESTED_VIDEO_FRAMERATE,
+    });
     this.videoRenderer = new CanvasVideoRenderer();
 
     this.callsByConversation = {};
@@ -127,6 +298,10 @@ export class CallingClass {
     RingRTC.handleLogMessage = this.handleLogMessage.bind(this);
     RingRTC.handleSendHttpRequest = this.handleSendHttpRequest.bind(this);
     RingRTC.handleSendCallMessage = this.handleSendCallMessage.bind(this);
+
+    ipcRenderer.on('stop-screen-share', () => {
+      uxActions.setPresenting();
+    });
   }
 
   async startCallingLobby(
@@ -247,7 +422,7 @@ export class CallingClass {
   }
 
   stopCallingLobby(conversationId?: string): void {
-    this.disableLocalCamera();
+    this.disableLocalVideo();
     this.stopDeviceReselectionTimer();
     this.lastMediaDeviceSettings = undefined;
 
@@ -343,8 +518,8 @@ export class CallingClass {
     return getMembershipList(conversationId).map(
       member =>
         new GroupMemberInfo(
-          uuidToArrayBuffer(member.uuid),
-          member.uuidCiphertext
+          Buffer.from(uuidToArrayBuffer(member.uuid)),
+          Buffer.from(member.uuidCiphertext)
         )
     );
   }
@@ -384,11 +559,11 @@ export class CallingClass {
     if (!proof) {
       throw new Error('No membership proof. Cannot peek group call');
     }
-    const membershipProof = new TextEncoder().encode(proof).buffer;
+    const membershipProof = Bytes.fromString(proof);
 
     return RingRTC.peekGroupCall(
       this.sfuUrl,
-      membershipProof,
+      Buffer.from(membershipProof),
       this.getGroupCallMembers(conversationId)
     );
   }
@@ -427,7 +602,7 @@ export class CallingClass {
       throw new Error('Missing SFU URL; not connecting group call');
     }
 
-    const groupIdBuffer = base64ToArrayBuffer(groupId);
+    const groupIdBuffer = Buffer.from(Bytes.fromBase64(groupId));
 
     let updateMessageState = GroupCallUpdateMessageState.SentNothing;
     let isRequestingMembershipProof = false;
@@ -441,7 +616,7 @@ export class CallingClass {
           // NOTE: This assumes that only one call is active at a time. For example, if
           //   there are two calls using the camera, this will disable both of them.
           //   That's fine for now, but this will break if that assumption changes.
-          this.disableLocalCamera();
+          this.disableLocalVideo();
 
           delete this.callsByConversation[conversationId];
 
@@ -457,7 +632,7 @@ export class CallingClass {
 
           // NOTE: This assumes only one active call at a time. See comment above.
           if (localDeviceState.videoMuted) {
-            this.disableLocalCamera();
+            this.disableLocalVideo();
           } else {
             this.videoCapturer.enableCaptureAndSend(groupCall);
           }
@@ -507,8 +682,7 @@ export class CallingClass {
             secretParams,
           });
           if (proof) {
-            const proofArray = new TextEncoder().encode(proof);
-            groupCall.setMembershipProof(proofArray.buffer);
+            groupCall.setMembershipProof(Buffer.from(Bytes.fromString(proof)));
           }
         } catch (err) {
           window.log.error('Failed to fetch membership proof', err);
@@ -631,7 +805,7 @@ export class CallingClass {
   ): GroupCallPeekInfoType {
     return {
       uuids: peekInfo.joinedMembers.map(uuidBuffer => {
-        let uuid = arrayBufferToUuid(uuidBuffer);
+        let uuid = arrayBufferToUuid(typedArrayToArrayBuffer(uuidBuffer));
         if (!uuid) {
           window.log.error(
             'Calling.formatGroupCallPeekInfoForRedux: could not convert peek UUID ArrayBuffer to string; using fallback UUID'
@@ -640,7 +814,9 @@ export class CallingClass {
         }
         return uuid;
       }),
-      creatorUuid: peekInfo.creator && arrayBufferToUuid(peekInfo.creator),
+      creatorUuid:
+        peekInfo.creator &&
+        arrayBufferToUuid(typedArrayToArrayBuffer(peekInfo.creator)),
       eraId: peekInfo.eraId,
       maxDevices: peekInfo.maxDevices ?? Infinity,
       deviceCount: peekInfo.deviceCount,
@@ -677,7 +853,9 @@ export class CallingClass {
         ? this.formatGroupCallPeekInfoForRedux(peekInfo)
         : undefined,
       remoteParticipants: remoteDeviceStates.map(remoteDeviceState => {
-        let uuid = arrayBufferToUuid(remoteDeviceState.userId);
+        let uuid = arrayBufferToUuid(
+          typedArrayToArrayBuffer(remoteDeviceState.userId)
+        );
         if (!uuid) {
           window.log.error(
             'Calling.formatGroupCallForRedux: could not convert remote participant UUID ArrayBuffer to string; using fallback UUID'
@@ -689,6 +867,8 @@ export class CallingClass {
           demuxId: remoteDeviceState.demuxId,
           hasRemoteAudio: !remoteDeviceState.audioMuted,
           hasRemoteVideo: !remoteDeviceState.videoMuted,
+          presenting: Boolean(remoteDeviceState.presenting),
+          sharingScreen: Boolean(remoteDeviceState.sharingScreen),
           speakerTime: normalizeGroupCallTimestamp(
             remoteDeviceState.speakerTime
           ),
@@ -730,10 +910,10 @@ export class CallingClass {
     });
   }
 
-  private sendGroupCallUpdateMessage(
+  private async sendGroupCallUpdateMessage(
     conversationId: string,
     eraId: string
-  ): void {
+  ): Promise<void> {
     const conversation = window.ConversationController.get(conversationId);
     if (!conversation) {
       window.log.error(
@@ -743,7 +923,7 @@ export class CallingClass {
     }
 
     const groupV2 = conversation.getGroupV2Info();
-    const sendOptions = conversation.getSendOptions();
+    const sendOptions = await getSendOptions(conversation.attributes);
     if (!groupV2) {
       window.log.error(
         'Unable to send group call update message for conversation that lacks groupV2 info'
@@ -754,14 +934,27 @@ export class CallingClass {
     const timestamp = Date.now();
 
     // We "fire and forget" because sending this message is non-essential.
+    const { ContentHint } = Proto.UnidentifiedSenderMessage.Message;
     wrapWithSyncMessageSend({
       conversation,
-      logId: `sendGroupCallUpdateMessage/${conversationId}-${eraId}`,
-      send: sender =>
-        sender.sendGroupCallUpdate({ eraId, groupV2, timestamp }, sendOptions),
+      logId: `sendToGroup/groupCallUpdate/${conversationId}-${eraId}`,
+      messageIds: [],
+      send: () =>
+        window.Signal.Util.sendToGroup({
+          groupSendOptions: { groupCallUpdate: { eraId }, groupV2, timestamp },
+          conversation,
+          contentHint: ContentHint.DEFAULT,
+          messageId: undefined,
+          sendOptions,
+          sendType: 'callingMessage',
+        }),
+      sendType: 'callingMessage',
       timestamp,
     }).catch(err => {
-      window.log.error('Failed to send group call update', err);
+      window.log.error(
+        'Failed to send group call update:',
+        err && err.stack ? err.stack : err
+      );
     });
   }
 
@@ -807,6 +1000,8 @@ export class CallingClass {
       return;
     }
 
+    ipcRenderer.send('close-screen-share-controller');
+
     if (call instanceof Call) {
       RingRTC.hangup(call.callId);
     } else if (call instanceof GroupCall) {
@@ -848,6 +1043,102 @@ export class CallingClass {
       call.setOutgoingVideoMuted(!enabled);
     } else {
       throw missingCaseError(call);
+    }
+  }
+
+  private setOutgoingVideoIsScreenShare(
+    call: Call | GroupCall,
+    enabled: boolean
+  ): void {
+    if (call instanceof Call) {
+      RingRTC.setOutgoingVideoIsScreenShare(call.callId, enabled);
+      // Note: there is no "presenting" API for direct calls.
+    } else if (call instanceof GroupCall) {
+      call.setOutgoingVideoIsScreenShare(enabled);
+      call.setPresenting(enabled);
+    } else {
+      throw missingCaseError(call);
+    }
+  }
+
+  async getPresentingSources(): Promise<Array<PresentableSource>> {
+    const sources = await desktopCapturer.getSources({
+      fetchWindowIcons: true,
+      thumbnailSize: { height: 102, width: 184 },
+      types: ['window', 'screen'],
+    });
+
+    const presentableSources: Array<PresentableSource> = [];
+
+    sources.forEach(source => {
+      // If electron can't retrieve a thumbnail then it won't be able to
+      // present this source so we filter these out.
+      if (source.thumbnail.isEmpty()) {
+        return;
+      }
+      presentableSources.push({
+        appIcon:
+          source.appIcon && !source.appIcon.isEmpty()
+            ? source.appIcon.toDataURL()
+            : undefined,
+        id: source.id,
+        name: translateSourceName(window.i18n, source),
+        isScreen: isScreenSource(source),
+        thumbnail: source.thumbnail.toDataURL(),
+      });
+    });
+
+    return presentableSources;
+  }
+
+  setPresenting(
+    conversationId: string,
+    hasLocalVideo: boolean,
+    source?: PresentedSource
+  ): void {
+    const call = getOwn(this.callsByConversation, conversationId);
+    if (!call) {
+      window.log.warn('Trying to set presenting for a non-existent call');
+      return;
+    }
+
+    this.videoCapturer.disable();
+    if (source) {
+      this.hadLocalVideoBeforePresenting = hasLocalVideo;
+      this.videoCapturer.enableCaptureAndSend(call, {
+        // 15fps is much nicer but takes up a lot more CPU.
+        maxFramerate: 5,
+        maxHeight: 1080,
+        maxWidth: 1920,
+        screenShareSourceId: source.id,
+      });
+      this.setOutgoingVideo(conversationId, true);
+    } else {
+      this.setOutgoingVideo(
+        conversationId,
+        this.hadLocalVideoBeforePresenting ?? hasLocalVideo
+      );
+      this.hadLocalVideoBeforePresenting = undefined;
+    }
+
+    const isPresenting = Boolean(source);
+    this.setOutgoingVideoIsScreenShare(call, isPresenting);
+
+    if (source) {
+      ipcRenderer.send('show-screen-share', source.name);
+      notify({
+        icon: 'images/icons/v2/video-solid-24.svg',
+        message: window.i18n('calling__presenting--notification-body'),
+        onNotificationClick: () => {
+          if (this.uxActions) {
+            this.uxActions.setPresenting();
+          }
+        },
+        silent: true,
+        title: window.i18n('calling__presenting--notification-title'),
+      });
+    } else {
+      ipcRenderer.send('close-screen-share-controller');
     }
   }
 
@@ -1066,7 +1357,7 @@ export class CallingClass {
     this.videoCapturer.enableCapture();
   }
 
-  disableLocalCamera(): void {
+  disableLocalVideo(): void {
     this.videoCapturer.disable();
   }
 
@@ -1077,8 +1368,8 @@ export class CallingClass {
   }
 
   async handleCallingMessage(
-    envelope: EnvelopeClass,
-    callingMessage: CallingMessage
+    envelope: ProcessedEnvelope,
+    callingMessage: Proto.ICallingMessage
   ): Promise<void> {
     window.log.info('CallingClass.handleCallingMessage()');
 
@@ -1107,9 +1398,13 @@ export class CallingClass {
     }
     const senderIdentityKey = senderIdentityRecord.publicKey.slice(1); // Ignore the type header, it is not used.
 
-    const receiverIdentityRecord = window.textsecure.storage.protocol.getIdentityRecord(
+    const ourIdentifier =
       window.textsecure.storage.user.getUuid() ||
-        window.textsecure.storage.user.getNumber()
+      window.textsecure.storage.user.getNumber();
+    assert(ourIdentifier, 'We should have either uuid or number');
+
+    const receiverIdentityRecord = window.textsecure.storage.protocol.getIdentityRecord(
+      ourIdentifier
     );
     if (!receiverIdentityRecord) {
       window.log.error(
@@ -1140,9 +1435,11 @@ export class CallingClass {
 
       await this.handleOutgoingSignaling(remoteUserId, message);
 
+      const ProtoOfferType = Proto.CallingMessage.Offer.Type;
       this.addCallHistoryForFailedIncomingCall(
         conversation,
-        callingMessage.offer.type === OfferType.VideoCall
+        callingMessage.offer.type === ProtoOfferType.OFFER_VIDEO_CALL,
+        envelope.timestamp
       );
 
       return;
@@ -1158,13 +1455,13 @@ export class CallingClass {
 
     RingRTC.handleCallingMessage(
       remoteUserId,
-      sourceUuid,
+      sourceUuid ? Buffer.from(sourceUuid) : null,
       remoteDeviceId,
       this.localDeviceId,
       messageAgeSec,
-      callingMessage,
-      senderIdentityKey,
-      receiverIdentityKey
+      protoToCallingMessage(callingMessage),
+      Buffer.from(senderIdentityKey),
+      Buffer.from(receiverIdentityKey)
     );
   }
 
@@ -1238,17 +1535,17 @@ export class CallingClass {
   }
 
   private async handleSendCallMessage(
-    recipient: ArrayBuffer,
-    data: ArrayBuffer
+    recipient: Uint8Array,
+    data: Uint8Array
   ): Promise<boolean> {
-    const userId = arrayBufferToUuid(recipient);
+    const userId = arrayBufferToUuid(typedArrayToArrayBuffer(recipient));
     if (!userId) {
       window.log.error('handleSendCallMessage(): bad recipient UUID');
       return false;
     }
     const message = new CallingMessage();
     message.opaque = new OpaqueMessage();
-    message.opaque.data = data;
+    message.opaque.data = Buffer.from(data);
     return this.handleOutgoingSignaling(userId, message);
   }
 
@@ -1258,7 +1555,7 @@ export class CallingClass {
   ): Promise<boolean> {
     const conversation = window.ConversationController.get(remoteUserId);
     const sendOptions = conversation
-      ? conversation.getSendOptions()
+      ? await getSendOptions(conversation.attributes)
       : undefined;
 
     if (!window.textsecure.messaging) {
@@ -1267,11 +1564,18 @@ export class CallingClass {
     }
 
     try {
-      await window.textsecure.messaging.sendCallingMessage(
-        remoteUserId,
-        message,
-        sendOptions
+      const result = await handleMessageSend(
+        window.textsecure.messaging.sendCallingMessage(
+          remoteUserId,
+          callingMessageToProto(message),
+          sendOptions
+        ),
+        { messageIds: [], sendType: 'callingMessage' }
       );
+
+      if (result && result.errors && result.errors.length) {
+        throw result.errors[0];
+      }
 
       window.log.info('handleOutgoingSignaling() completed successfully');
       return true;
@@ -1316,7 +1620,8 @@ export class CallingClass {
         );
         this.addCallHistoryForFailedIncomingCall(
           conversation,
-          call.isVideoCall
+          call.isVideoCall,
+          Date.now()
         );
         return null;
       }
@@ -1333,7 +1638,11 @@ export class CallingClass {
       return await this.getCallSettings(conversation);
     } catch (err) {
       window.log.error(`Ignoring incoming call: ${err.stack}`);
-      this.addCallHistoryForFailedIncomingCall(conversation, call.isVideoCall);
+      this.addCallHistoryForFailedIncomingCall(
+        conversation,
+        call.isVideoCall,
+        Date.now()
+      );
       return null;
     }
   }
@@ -1387,6 +1696,14 @@ export class CallingClass {
         hasVideo: call.remoteVideoEnabled,
       });
     };
+
+    // eslint-disable-next-line no-param-reassign
+    call.handleRemoteSharingScreen = () => {
+      uxActions.remoteSharingScreenChange({
+        conversationId: conversation.id,
+        isSharingScreen: Boolean(call.remoteSharingScreen),
+      });
+    };
   }
 
   private async handleLogMessage(
@@ -1415,7 +1732,7 @@ export class CallingClass {
     url: string,
     method: HttpMethod,
     headers: { [name: string]: string },
-    body: ArrayBuffer | undefined
+    body: Uint8Array | undefined
   ) {
     if (!window.textsecure.messaging) {
       RingRTC.httpRequestFailed(requestId, 'We are offline');
@@ -1437,14 +1754,14 @@ export class CallingClass {
         url,
         httpMethod,
         headers,
-        body
+        body ? typedArrayToArrayBuffer(body) : undefined
       );
     } catch (err) {
       if (err.code !== -1) {
         // WebAPI treats certain response codes as errors, but RingRTC still needs to
         // see them. It does not currently look at the response body, so we're giving
         // it an empty one.
-        RingRTC.receivedHttpResponse(requestId, err.code, new ArrayBuffer(0));
+        RingRTC.receivedHttpResponse(requestId, err.code, Buffer.alloc(0));
       } else {
         window.log.error('handleSendHttpRequest: fetch failed with error', err);
         RingRTC.httpRequestFailed(requestId, String(err));
@@ -1455,7 +1772,7 @@ export class CallingClass {
     RingRTC.receivedHttpResponse(
       requestId,
       result.response.status,
-      result.data
+      Buffer.from(result.data)
     );
   }
 
@@ -1540,7 +1857,8 @@ export class CallingClass {
 
   private addCallHistoryForFailedIncomingCall(
     conversation: ConversationModel,
-    wasVideoCall: boolean
+    wasVideoCall: boolean,
+    timestamp: number
   ) {
     conversation.addCallHistory({
       callMode: CallMode.Direct,
@@ -1549,7 +1867,7 @@ export class CallingClass {
       // Since the user didn't decline, make sure it shows up as a missed call instead
       wasDeclined: false,
       acceptedTime: undefined,
-      endedTime: Date.now(),
+      endedTime: timestamp,
     });
   }
 
@@ -1578,7 +1896,9 @@ export class CallingClass {
     if (!peekInfo || !peekInfo.eraId || !peekInfo.creator) {
       return;
     }
-    const creatorUuid = arrayBufferToUuid(peekInfo.creator);
+    const creatorUuid = arrayBufferToUuid(
+      typedArrayToArrayBuffer(peekInfo.creator)
+    );
     if (!creatorUuid) {
       window.log.error('updateCallHistoryForGroupCall(): bad creator UUID');
       return;

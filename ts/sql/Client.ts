@@ -7,6 +7,7 @@
 /* eslint-disable @typescript-eslint/explicit-module-boundary-types */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /* eslint-disable @typescript-eslint/ban-types */
+/* eslint-disable no-restricted-syntax */
 import { ipcRenderer } from 'electron';
 
 import {
@@ -20,6 +21,8 @@ import {
   map,
   omit,
   set,
+  toPairs,
+  uniq,
 } from 'lodash';
 
 import { arrayBufferToBase64, base64ToArrayBuffer } from '../Crypto';
@@ -27,23 +30,35 @@ import { CURRENT_SCHEMA_VERSION } from '../../js/modules/types/message';
 import { createBatcher } from '../util/batcher';
 import { assert } from '../util/assert';
 import { cleanDataForIpc } from './cleanDataForIpc';
+import { ReactionType } from '../types/Reactions';
+import { ConversationColorType, CustomColorType } from '../types/Colors';
 
 import {
   ConversationModelCollectionType,
   MessageModelCollectionType,
 } from '../model-types.d';
+import { StoredJob } from '../jobs/types';
 
 import {
   AttachmentDownloadJobType,
   ClientInterface,
   ClientJobType,
+  ClientSearchResultMessageType,
   ConversationType,
   IdentityKeyType,
+  ItemKeyType,
   ItemType,
   MessageType,
   MessageTypeUnhydrated,
   PreKeyType,
   SearchResultMessageType,
+  SenderKeyType,
+  SentMessageDBType,
+  SentMessagesType,
+  SentProtoType,
+  SentProtoWithMessageIdsType,
+  SentRecipientsDBType,
+  SentRecipientsType,
   ServerInterface,
   SessionType,
   SignedPreKeyType,
@@ -51,11 +66,11 @@ import {
   StickerPackType,
   StickerType,
   UnprocessedType,
+  UnprocessedUpdateType,
 } from './Interface';
 import Server from './Server';
 import { MessageModel } from '../models/messages';
 import { ConversationModel } from '../models/conversations';
-import { waitForPendingQueries } from './Queueing';
 
 // We listen to a lot of events on ipcRenderer, often on the same channel. This prevents
 //   any warnings that might be sent to the console in that case.
@@ -66,6 +81,8 @@ if (ipcRenderer && ipcRenderer.setMaxListeners) {
 }
 
 const DATABASE_UPDATE_TIMEOUT = 2 * 60 * 1000; // two minutes
+
+const MIN_TRACE_DURATION = 10;
 
 const SQL_CHANNEL_KEY = 'sql-channel';
 const ERASE_SQL_KEY = 'erase-sql-key';
@@ -89,6 +106,7 @@ let _shuttingDown = false;
 let _shutdownCallback: Function | null = null;
 let _shutdownPromise: Promise<any> | null = null;
 let shouldUseRendererProcess = true;
+const startupQueries = new Map<string, number>();
 
 // Because we can't force this module to conform to an interface, we narrow our exports
 //   to this one default export, which does conform to the interface.
@@ -123,14 +141,29 @@ const dataInterface: ClientInterface = {
   createOrUpdateItem,
   getItemById,
   getAllItems,
-  bulkAddItems,
   removeItemById,
   removeAllItems,
 
+  createOrUpdateSenderKey,
+  getSenderKeyById,
+  removeAllSenderKeys,
+  getAllSenderKeys,
+  removeSenderKeyById,
+
+  insertSentProto,
+  deleteSentProtosOlderThan,
+  deleteSentProtoByMessageId,
+  insertProtoRecipients,
+  deleteSentProtoRecipient,
+  getSentProtoByRecipient,
+  removeAllSentProtos,
+  getAllSentProtos,
+  _getAllSentProtoRecipients,
+  _getAllSentProtoMessageIds,
+
   createOrUpdateSession,
   createOrUpdateSessions,
-  getSessionById,
-  getSessionsById,
+  commitSessionsAndUnprocessed,
   bulkAddSessions,
   removeSessionById,
   removeSessionsByConversation,
@@ -144,6 +177,7 @@ const dataInterface: ClientInterface = {
   updateConversation,
   updateConversations,
   removeConversation,
+  updateAllConversationColors,
 
   eraseStorageServiceStateFromConversations,
   getAllConversations,
@@ -156,20 +190,26 @@ const dataInterface: ClientInterface = {
   searchMessagesInConversation,
 
   getMessageCount,
+  hasUserInitiatedMessages,
   saveMessage,
   saveMessages,
   removeMessage,
   removeMessages,
-  getUnreadByConversation,
+  getUnreadCountForConversation,
+  getUnreadByConversationAndMarkRead,
+  getUnreadReactionsAndMarkRead,
+  markReactionAsRead,
+  removeReactionFromConversation,
+  addReaction,
 
   getMessageBySender,
   getMessageById,
   getAllMessageIds,
   getMessagesBySentAt,
   getExpiredMessages,
-  getOutgoingWithoutExpiresAt,
-  getNextExpiringMessage,
-  getNextTapToViewMessageToAgeOut,
+  getMessagesUnexpectedlyMissingExpirationStartTimestamp,
+  getSoonestMessageExpiry,
+  getNextTapToViewMessageTimestampToAgeOut,
   getTapToViewMessagesNeedingErase,
   getOlderMessagesByConversation,
   getNewerMessagesByConversation,
@@ -182,8 +222,6 @@ const dataInterface: ClientInterface = {
   getUnprocessedCount,
   getAllUnprocessed,
   getUnprocessedById,
-  saveUnprocessed,
-  saveUnprocesseds,
   updateUnprocessedAttempts,
   updateUnprocessedWithData,
   updateUnprocessedsWithData,
@@ -219,6 +257,11 @@ const dataInterface: ClientInterface = {
   getMessagesNeedingUpgrade,
   getMessagesWithVisualMediaAttachments,
   getMessagesWithFileAttachments,
+  getMessageServerGuidsForSpam,
+
+  getJobsInQueue,
+  insertJob,
+  deleteJob,
 
   // Test-only
 
@@ -243,22 +286,39 @@ const dataInterface: ClientInterface = {
 export default dataInterface;
 
 async function goBackToMainProcess(): Promise<void> {
-  window.log.info('data.goBackToMainProcess: waiting for pending queries');
+  if (!shouldUseRendererProcess) {
+    window.log.info(
+      'data.goBackToMainProcess: already switched to main process'
+    );
+    return;
+  }
 
-  // Let pending queries finish before we'll give write access to main process.
-  // We don't want to be writing from two processes at the same time!
-  await waitForPendingQueries();
-
+  // We don't need to wait for pending queries since they are synchronous.
   window.log.info('data.goBackToMainProcess: switching to main process');
 
+  // Close the database in the renderer process.
+  await close();
+
   shouldUseRendererProcess = false;
+
+  // Print query statistics for whole startup
+  const entries = Array.from(startupQueries.entries());
+  startupQueries.clear();
+
+  // Sort by decreasing duration
+  entries
+    .sort((a, b) => b[1] - a[1])
+    .filter(([_, duration]) => duration > MIN_TRACE_DURATION)
+    .forEach(([query, duration]) => {
+      window.log.info(`startup query: ${query} ${duration}ms`);
+    });
 }
 
 const channelsAsUnknown = fromPairs(
   compact(
-    map(dataInterface, (value: any) => {
+    map(toPairs(dataInterface), ([name, value]: [string, any]) => {
       if (isFunction(value)) {
-        return [value.name, makeChannel(value.name)];
+        return [name, makeChannel(name)];
       }
 
       return null;
@@ -358,8 +418,7 @@ function _updateJob(id: number, data: ClientJobUpdateType) {
     resolve: (value: any) => {
       _removeJob(id);
       const end = Date.now();
-      const delta = end - start;
-      if (delta > 10 || _DEBUG) {
+      if (_DEBUG) {
         window.log.info(
           `SQL channel job ${id} (${fnName}) succeeded in ${end - start}ms`
         );
@@ -374,9 +433,14 @@ function _updateJob(id: number, data: ClientJobUpdateType) {
         `SQL channel job ${id} (${fnName}) failed in ${end - start}ms`
       );
 
-      if (error && error.message && error.message.includes('SQLITE_CORRUPT')) {
+      if (
+        error &&
+        error.message &&
+        (error.message.includes('SQLITE_CORRUPT') ||
+          error.message.includes('database disk image is malformed'))
+      ) {
         window.log.error(
-          'Detected SQLITE_CORRUPT error; restarting the application immediately'
+          `Detected corruption. Restarting the application immediately. Error: ${error.message}`
         );
         window.restart();
       }
@@ -449,10 +513,27 @@ function makeChannel(fnName: string) {
     // UI from locking up whenever we do costly db operations.
     if (shouldUseRendererProcess) {
       const serverFnName = fnName as keyof ServerInterface;
+      const start = Date.now();
+
       // Ignoring this error TS2556: Expected 3 arguments, but got 0 or more.
       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-ignore
-      return Server[serverFnName](...args);
+      const result = Server[serverFnName](...args);
+
+      const duration = Date.now() - start;
+
+      startupQueries.set(
+        serverFnName,
+        (startupQueries.get(serverFnName) || 0) + duration
+      );
+
+      if (duration > MIN_TRACE_DURATION || _DEBUG) {
+        window.log.info(
+          `Renderer SQL channel job (${fnName}) succeeded in ${duration}ms`
+        );
+      }
+
+      return result;
     }
 
     const jobId = _makeJob(fnName);
@@ -514,8 +595,6 @@ function keysFromArrayBuffer(keys: Array<string>, data: any) {
 // Top-level calls
 
 async function shutdown() {
-  await waitForPendingQueries();
-
   // Stop accepting new SQL jobs, flush outstanding queue
   await _shutdown();
 
@@ -637,14 +716,13 @@ async function removeAllSignedPreKeys() {
 
 // Items
 
-const ITEM_KEYS: { [key: string]: Array<string> | undefined } = {
+const ITEM_KEYS: Partial<Record<ItemKeyType, Array<string>>> = {
   identityKey: ['value.pubKey', 'value.privKey'],
   senderCertificate: ['value.serialized'],
   senderCertificateNoE164: ['value.serialized'],
-  signaling_key: ['value'],
   profileKey: ['value'],
 };
-async function createOrUpdateItem(data: ItemType) {
+async function createOrUpdateItem<K extends ItemKeyType>(data: ItemType<K>) {
   const { id } = data;
   if (!id) {
     throw new Error(
@@ -657,7 +735,7 @@ async function createOrUpdateItem(data: ItemType) {
 
   await channels.createOrUpdateItem(updated);
 }
-async function getItemById(id: string) {
+async function getItemById<K extends ItemKeyType>(id: K): Promise<ItemType<K>> {
   const keys = ITEM_KEYS[id];
   const data = await channels.getItemById(id);
 
@@ -666,27 +744,108 @@ async function getItemById(id: string) {
 async function getAllItems() {
   const items = await channels.getAllItems();
 
-  return map(items, item => {
-    const { id } = item;
-    const keys = ITEM_KEYS[id];
+  const result = Object.create(null);
 
-    return Array.isArray(keys) ? keysToArrayBuffer(keys, item) : item;
-  });
-}
-async function bulkAddItems(array: Array<ItemType>) {
-  const updated = map(array, data => {
-    const { id } = data;
-    const keys = ITEM_KEYS[id];
+  for (const id of Object.keys(items)) {
+    const key = id as ItemKeyType;
+    const value = items[key];
 
-    return keys && Array.isArray(keys) ? keysFromArrayBuffer(keys, data) : data;
-  });
-  await channels.bulkAddItems(updated);
+    const keys = ITEM_KEYS[key];
+
+    const deserializedValue = Array.isArray(keys)
+      ? keysToArrayBuffer(keys, { value }).value
+      : value;
+
+    result[key] = deserializedValue;
+  }
+
+  return result;
 }
-async function removeItemById(id: string) {
+async function removeItemById(id: ItemKeyType) {
   await channels.removeItemById(id);
 }
 async function removeAllItems() {
   await channels.removeAllItems();
+}
+
+// Sender Keys
+
+async function createOrUpdateSenderKey(key: SenderKeyType): Promise<void> {
+  await channels.createOrUpdateSenderKey(key);
+}
+async function getSenderKeyById(
+  id: string
+): Promise<SenderKeyType | undefined> {
+  return channels.getSenderKeyById(id);
+}
+async function removeAllSenderKeys(): Promise<void> {
+  await channels.removeAllSenderKeys();
+}
+async function getAllSenderKeys(): Promise<Array<SenderKeyType>> {
+  return channels.getAllSenderKeys();
+}
+async function removeSenderKeyById(id: string): Promise<void> {
+  return channels.removeSenderKeyById(id);
+}
+
+// Sent Protos
+
+async function insertSentProto(
+  proto: SentProtoType,
+  options: {
+    messageIds: SentMessagesType;
+    recipients: SentRecipientsType;
+  }
+): Promise<number> {
+  return channels.insertSentProto(proto, {
+    ...options,
+    messageIds: uniq(options.messageIds),
+  });
+}
+async function deleteSentProtosOlderThan(timestamp: number): Promise<void> {
+  await channels.deleteSentProtosOlderThan(timestamp);
+}
+async function deleteSentProtoByMessageId(messageId: string): Promise<void> {
+  await channels.deleteSentProtoByMessageId(messageId);
+}
+
+async function insertProtoRecipients(options: {
+  id: number;
+  recipientUuid: string;
+  deviceIds: Array<number>;
+}): Promise<void> {
+  await channels.insertProtoRecipients(options);
+}
+async function deleteSentProtoRecipient(options: {
+  timestamp: number;
+  recipientUuid: string;
+  deviceId: number;
+}): Promise<void> {
+  await channels.deleteSentProtoRecipient(options);
+}
+
+async function getSentProtoByRecipient(options: {
+  now: number;
+  recipientUuid: string;
+  timestamp: number;
+}): Promise<SentProtoWithMessageIdsType | undefined> {
+  return channels.getSentProtoByRecipient(options);
+}
+async function removeAllSentProtos(): Promise<void> {
+  await channels.removeAllSentProtos();
+}
+async function getAllSentProtos(): Promise<Array<SentProtoType>> {
+  return channels.getAllSentProtos();
+}
+
+// Test-only:
+async function _getAllSentProtoRecipients(): Promise<
+  Array<SentRecipientsDBType>
+> {
+  return channels._getAllSentProtoRecipients();
+}
+async function _getAllSentProtoMessageIds(): Promise<Array<SentMessageDBType>> {
+  return channels._getAllSentProtoMessageIds();
 }
 
 // Sessions
@@ -697,15 +856,11 @@ async function createOrUpdateSession(data: SessionType) {
 async function createOrUpdateSessions(array: Array<SessionType>) {
   await channels.createOrUpdateSessions(array);
 }
-async function getSessionById(id: string) {
-  const session = await channels.getSessionById(id);
-
-  return session;
-}
-async function getSessionsById(id: string) {
-  const sessions = await channels.getSessionsById(id);
-
-  return sessions;
+async function commitSessionsAndUnprocessed(options: {
+  sessions: Array<SessionType>;
+  unprocessed: Array<UnprocessedType>;
+}) {
+  await channels.commitSessionsAndUnprocessed(options);
 }
 async function bulkAddSessions(array: Array<SessionType>) {
   await channels.bulkAddSessions(array);
@@ -761,7 +916,13 @@ const updateConversationBatcher = createBatcher<ConversationType>({
     // We only care about the most recent update for each conversation
     const byId = groupBy(items, item => item.id);
     const ids = Object.keys(byId);
-    const mostRecent = ids.map(id => last(byId[id]));
+    const mostRecent = ids.map(
+      (id: string): ConversationType => {
+        const maybeLast = last(byId[id]);
+        assert(maybeLast !== undefined, 'Empty array in `groupBy` result');
+        return maybeLast;
+      }
+    );
 
     await updateConversations(mostRecent);
   },
@@ -857,8 +1018,15 @@ async function searchConversations(query: string) {
   return conversations;
 }
 
-function handleSearchMessageJSON(messages: Array<SearchResultMessageType>) {
+function handleSearchMessageJSON(
+  messages: Array<SearchResultMessageType>
+): Array<ClientSearchResultMessageType> {
   return messages.map(message => ({
+    json: message.json,
+
+    // Empty array is a default value. `message.json` has the real field
+    bodyRanges: [],
+
     ...JSON.parse(message.json),
     snippet: message.snippet,
   }));
@@ -893,26 +1061,33 @@ async function getMessageCount(conversationId?: string) {
   return channels.getMessageCount(conversationId);
 }
 
+async function hasUserInitiatedMessages(conversationId: string) {
+  return channels.hasUserInitiatedMessages(conversationId);
+}
+
 async function saveMessage(
   data: MessageType,
-  { forceSave, Message }: { forceSave?: boolean; Message: typeof MessageModel }
+  options?: { forceSave?: boolean }
 ) {
-  const id = await channels.saveMessage(_cleanMessageData(data), {
-    forceSave,
-  });
-  Message.updateTimers();
+  const id = await channels.saveMessage(_cleanMessageData(data), options);
+
+  window.Whisper.ExpiringMessagesListener.update();
+  window.Whisper.TapToViewMessagesListener.update();
 
   return id;
 }
 
 async function saveMessages(
   arrayOfMessages: Array<MessageType>,
-  { forceSave }: { forceSave?: boolean } = {}
+  options?: { forceSave?: boolean }
 ) {
   await channels.saveMessages(
     arrayOfMessages.map(message => _cleanMessageData(message)),
-    { forceSave }
+    options
   );
+
+  window.Whisper.ExpiringMessagesListener.update();
+  window.Whisper.TapToViewMessagesListener.update();
 }
 
 async function removeMessage(
@@ -940,7 +1115,7 @@ async function getMessageById(
 ) {
   const message = await channels.getMessageById(id);
   if (!message) {
-    return null;
+    return undefined;
   }
 
   return new Message(message);
@@ -990,15 +1165,47 @@ async function getMessageBySender(
   return new Message(messages[0]);
 }
 
-async function getUnreadByConversation(
-  conversationId: string,
-  {
-    MessageCollection,
-  }: { MessageCollection: typeof MessageModelCollectionType }
-) {
-  const messages = await channels.getUnreadByConversation(conversationId);
+async function getUnreadCountForConversation(conversationId: string) {
+  return channels.getUnreadCountForConversation(conversationId);
+}
 
-  return new MessageCollection(messages);
+async function getUnreadByConversationAndMarkRead(
+  conversationId: string,
+  newestUnreadId: number,
+  readAt?: number
+) {
+  return channels.getUnreadByConversationAndMarkRead(
+    conversationId,
+    newestUnreadId,
+    readAt
+  );
+}
+
+async function getUnreadReactionsAndMarkRead(
+  conversationId: string,
+  newestUnreadId: number
+) {
+  return channels.getUnreadReactionsAndMarkRead(conversationId, newestUnreadId);
+}
+
+async function markReactionAsRead(
+  targetAuthorUuid: string,
+  targetTimestamp: number
+) {
+  return channels.markReactionAsRead(targetAuthorUuid, targetTimestamp);
+}
+
+async function removeReactionFromConversation(reaction: {
+  emoji: string;
+  fromId: string;
+  targetAuthorUuid: string;
+  targetTimestamp: number;
+}) {
+  return channels.removeReactionFromConversation(reaction);
+}
+
+async function addReaction(reactionObj: ReactionType) {
+  return channels.addReaction(reactionObj);
 }
 
 function handleMessageJSON(messages: Array<MessageTypeUnhydrated>) {
@@ -1178,41 +1385,16 @@ async function getExpiredMessages({
   return new MessageCollection(messages);
 }
 
-async function getOutgoingWithoutExpiresAt({
-  MessageCollection,
-}: {
-  MessageCollection: typeof MessageModelCollectionType;
-}) {
-  const messages = await channels.getOutgoingWithoutExpiresAt();
-
-  return new MessageCollection(messages);
+function getMessagesUnexpectedlyMissingExpirationStartTimestamp() {
+  return channels.getMessagesUnexpectedlyMissingExpirationStartTimestamp();
 }
 
-async function getNextExpiringMessage({
-  Message,
-}: {
-  Message: typeof MessageModel;
-}) {
-  const message = await channels.getNextExpiringMessage();
-
-  if (message) {
-    return new Message(message);
-  }
-
-  return null;
+function getSoonestMessageExpiry() {
+  return channels.getSoonestMessageExpiry();
 }
 
-async function getNextTapToViewMessageToAgeOut({
-  Message,
-}: {
-  Message: typeof MessageModel;
-}) {
-  const message = await channels.getNextTapToViewMessageToAgeOut();
-  if (!message) {
-    return null;
-  }
-
-  return new Message(message);
+async function getNextTapToViewMessageTimestampToAgeOut() {
+  return channels.getNextTapToViewMessageTimestampToAgeOut();
 }
 async function getTapToViewMessagesNeedingErase({
   MessageCollection,
@@ -1238,31 +1420,18 @@ async function getUnprocessedById(id: string) {
   return channels.getUnprocessedById(id);
 }
 
-async function saveUnprocessed(
-  data: UnprocessedType,
-  { forceSave }: { forceSave?: boolean } = {}
-) {
-  const id = await channels.saveUnprocessed(_cleanData(data), { forceSave });
-
-  return id;
-}
-
-async function saveUnprocesseds(
-  arrayOfUnprocessed: Array<UnprocessedType>,
-  { forceSave }: { forceSave?: boolean } = {}
-) {
-  await channels.saveUnprocesseds(_cleanData(arrayOfUnprocessed), {
-    forceSave,
-  });
-}
-
 async function updateUnprocessedAttempts(id: string, attempts: number) {
   await channels.updateUnprocessedAttempts(id, attempts);
 }
-async function updateUnprocessedWithData(id: string, data: UnprocessedType) {
+async function updateUnprocessedWithData(
+  id: string,
+  data: UnprocessedUpdateType
+) {
   await channels.updateUnprocessedWithData(id, data);
 }
-async function updateUnprocessedsWithData(array: Array<UnprocessedType>) {
+async function updateUnprocessedsWithData(
+  array: Array<{ id: string; data: UnprocessedUpdateType }>
+) {
   await channels.updateUnprocessedsWithData(array);
 }
 
@@ -1439,4 +1608,35 @@ async function getMessagesWithFileAttachments(
   return channels.getMessagesWithFileAttachments(conversationId, {
     limit,
   });
+}
+
+function getMessageServerGuidsForSpam(
+  conversationId: string
+): Promise<Array<string>> {
+  return channels.getMessageServerGuidsForSpam(conversationId);
+}
+
+function getJobsInQueue(queueType: string): Promise<Array<StoredJob>> {
+  return channels.getJobsInQueue(queueType);
+}
+
+function insertJob(job: Readonly<StoredJob>): Promise<void> {
+  return channels.insertJob(job);
+}
+
+function deleteJob(id: string): Promise<void> {
+  return channels.deleteJob(id);
+}
+
+async function updateAllConversationColors(
+  conversationColor?: ConversationColorType,
+  customColorData?: {
+    id: string;
+    value: CustomColorType;
+  }
+): Promise<void> {
+  return channels.updateAllConversationColors(
+    conversationColor,
+    customColorData
+  );
 }

@@ -22,12 +22,6 @@ module.exports = grunt => {
     components.push(bower.concat.app[i]);
   }
 
-  const libtextsecurecomponents = [];
-  // eslint-disable-next-line guard-for-in, no-restricted-syntax
-  for (const i in bower.concat.libtextsecure) {
-    libtextsecurecomponents.push(bower.concat.libtextsecure[i]);
-  }
-
   grunt.loadNpmTasks('grunt-sass');
 
   grunt.initConfig({
@@ -37,10 +31,6 @@ module.exports = grunt => {
         src: components,
         dest: 'js/components.js',
       },
-      libtextsecurecomponents: {
-        src: libtextsecurecomponents,
-        dest: 'libtextsecure/components.js',
-      },
       test: {
         src: [
           'node_modules/mocha/mocha.js',
@@ -49,26 +39,9 @@ module.exports = grunt => {
         ],
         dest: 'test/test.js',
       },
-      // TODO: Move errors back down?
-      libtextsecure: {
-        options: {
-          banner: ';(function() {\n',
-          footer: '})();\n',
-        },
-        src: [
-          'libtextsecure/libsignal-protocol.js',
-          'libtextsecure/protocol_wrapper.js',
-
-          'libtextsecure/storage/user.js',
-          'libtextsecure/storage/unprocessed.js',
-          'libtextsecure/protobufs.js',
-        ],
-        dest: 'js/libtextsecure.js',
-      },
       libtextsecuretest: {
         src: [
           'node_modules/jquery/dist/jquery.js',
-          'components/mock-socket/dist/mock-socket.js',
           'node_modules/mocha/mocha.js',
           'node_modules/chai/chai.js',
           'libtextsecure/test/_test.js',
@@ -104,10 +77,6 @@ module.exports = grunt => {
       },
     },
     watch: {
-      libtextsecure: {
-        files: ['./libtextsecure/*.js', './libtextsecure/storage/*.js'],
-        tasks: ['concat:libtextsecure'],
-      },
       protobuf: {
         files: ['./protos/SignalService.proto'],
         tasks: ['exec:build-protobuf'],

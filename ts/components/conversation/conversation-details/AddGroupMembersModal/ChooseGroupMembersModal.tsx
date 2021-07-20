@@ -14,7 +14,7 @@ import { LocalizerType } from '../../../../types/Util';
 import { assert } from '../../../../util/assert';
 import { getOwn } from '../../../../util/getOwn';
 import { missingCaseError } from '../../../../util/missingCaseError';
-import { filterAndSortContacts } from '../../../../util/filterAndSortContacts';
+import { filterAndSortConversationsByTitle } from '../../../../util/filterAndSortConversations';
 import { ConversationType } from '../../../../state/ducks/conversations';
 import { ModalHost } from '../../../ModalHost';
 import { ContactPills } from '../../../ContactPills';
@@ -22,6 +22,7 @@ import { ContactPill } from '../../../ContactPill';
 import { ConversationList, Row, RowType } from '../../../ConversationList';
 import { ContactCheckboxDisabledReason } from '../../../conversationList/ContactCheckbox';
 import { Button, ButtonVariant } from '../../../Button';
+import { SearchInput } from '../../../SearchInput';
 
 type PropsType = {
   candidateContacts: ReadonlyArray<ConversationType>;
@@ -41,6 +42,7 @@ type PropsType = {
   toggleSelectedContact: (conversationId: string) => void;
 };
 
+// TODO: This should use <Modal>. See DESKTOP-1038.
 export const ChooseGroupMembersModal: FunctionComponent<PropsType> = ({
   candidateContacts,
   confirmAdds,
@@ -71,13 +73,16 @@ export const ChooseGroupMembersModal: FunctionComponent<PropsType> = ({
   const canContinue = Boolean(selectedContacts.length);
 
   const [filteredContacts, setFilteredContacts] = useState(
-    filterAndSortContacts(candidateContacts, '')
+    filterAndSortConversationsByTitle(candidateContacts, '')
   );
   const normalizedSearchTerm = searchTerm.trim();
   useEffect(() => {
     const timeout = setTimeout(() => {
       setFilteredContacts(
-        filterAndSortContacts(candidateContacts, normalizedSearchTerm)
+        filterAndSortConversationsByTitle(
+          candidateContacts,
+          normalizedSearchTerm
+        )
       );
     }, 200);
     return () => {
@@ -126,9 +131,7 @@ export const ChooseGroupMembersModal: FunctionComponent<PropsType> = ({
         <h1 className="module-AddGroupMembersModal__header">
           {i18n('AddGroupMembersModal--title')}
         </h1>
-        <input
-          type="text"
-          className="module-AddGroupMembersModal__search-input"
+        <SearchInput
           disabled={candidateContacts.length === 0}
           placeholder={i18n('contactSearchPlaceholder')}
           onChange={event => {
@@ -147,14 +150,17 @@ export const ChooseGroupMembersModal: FunctionComponent<PropsType> = ({
             {selectedContacts.map(contact => (
               <ContactPill
                 key={contact.id}
+                acceptedMessageRequest={contact.acceptedMessageRequest}
                 avatarPath={contact.avatarPath}
                 color={contact.color}
                 firstName={contact.firstName}
                 i18n={i18n}
+                isMe={contact.isMe}
                 id={contact.id}
                 name={contact.name}
                 phoneNumber={contact.phoneNumber}
                 profileName={contact.profileName}
+                sharedGroupNames={contact.sharedGroupNames}
                 title={contact.title}
                 onClickRemove={() => {
                   removeSelectedContact(contact.id);

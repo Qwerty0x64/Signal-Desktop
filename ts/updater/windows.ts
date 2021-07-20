@@ -18,6 +18,7 @@ import {
   setUpdateListener,
   showCannotUpdateDialog,
   showUpdateDialog,
+  UpdaterInterface,
 } from './common';
 import { LocaleType } from '../types/I18N';
 import { LoggerType } from '../types/Logging';
@@ -41,7 +42,7 @@ export async function start(
   getMainWindow: () => BrowserWindow,
   locale: LocaleType,
   logger: LoggerType
-): Promise<void> {
+): Promise<UpdaterInterface> {
   logger.info('windows/start: starting checks...');
 
   loggerForQuitHandler = logger;
@@ -59,26 +60,44 @@ export async function start(
 
   await deletePreviousInstallers(logger);
   await checkDownloadAndInstall(getMainWindow, locale, logger);
+
+  return {
+    async force(): Promise<void> {
+      return checkDownloadAndInstall(getMainWindow, locale, logger, true);
+    },
+  };
 }
 
 async function checkDownloadAndInstall(
   getMainWindow: () => BrowserWindow,
   locale: LocaleType,
-  logger: LoggerType
+  logger: LoggerType,
+  force = false
 ) {
   try {
     logger.info('checkDownloadAndInstall: checking for update...');
-    const result = await checkForUpdates(logger);
+    const result = await checkForUpdates(logger, force);
     if (!result) {
       return;
     }
 
     const { fileName: newFileName, version: newVersion } = result;
     if (fileName !== newFileName || !version || gt(newVersion, version)) {
+      const oldFileName = fileName;
+      const oldVersion = version;
+
       deleteCache(updateFilePath, logger);
       fileName = newFileName;
       version = newVersion;
-      updateFilePath = await downloadUpdate(fileName, logger);
+
+      try {
+        updateFilePath = await downloadUpdate(fileName, logger);
+      } catch (error) {
+        // Restore state in case of download error
+        fileName = oldFileName;
+        version = oldVersion;
+        throw error;
+      }
     }
 
     const publicKey = hexToBinary(getFromConfig('updatesPublicKey'));

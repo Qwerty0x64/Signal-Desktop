@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import memoizee from 'memoizee';
-import { fromPairs, isNumber, isString } from 'lodash';
+import { fromPairs, isNumber } from 'lodash';
 import { createSelector } from 'reselect';
 
 import { StateType } from '../reducer';
@@ -14,30 +14,36 @@ import {
   ConversationType,
   MessageLookupType,
   MessagesByConversationType,
-  MessageType,
   OneTimeModalState,
   PreJoinConversationType,
 } from '../ducks/conversations';
-import { LocalizerType } from '../../types/Util';
 import { getOwn } from '../../util/getOwn';
 import { deconstructLookup } from '../../util/deconstructLookup';
-import type { CallsByConversationType } from '../ducks/calling';
-import { getCallsByConversation } from './calling';
-import { getBubbleProps } from '../../shims/Whisper';
 import { PropsDataType as TimelinePropsType } from '../../components/conversation/Timeline';
 import { TimelineItemType } from '../../components/conversation/TimelineItem';
 import { assert } from '../../util/assert';
 import { isConversationUnregistered } from '../../util/isConversationUnregistered';
-import { filterAndSortContacts } from '../../util/filterAndSortContacts';
+import { filterAndSortConversationsByTitle } from '../../util/filterAndSortConversations';
+import { ContactNameColors, ContactNameColorType } from '../../types/Colors';
+import { isInSystemContacts } from '../../util/isInSystemContacts';
+import { isGroupV2 } from '../../util/whatTypeOfConversation';
 
 import {
-  getInteractionMode,
   getIntl,
   getRegionCode,
   getUserConversationId,
   getUserNumber,
+  getUserUuid,
 } from './user';
-import { getPinnedConversationIds } from './items';
+import { getPinnedConversationIds, getReadReceiptSetting } from './items';
+import { getPropsForBubble } from './message';
+import {
+  CallSelectorType,
+  CallStateType,
+  getActiveCall,
+  getCallSelector,
+} from './calling';
+import { getAccountSelector, AccountSelectorType } from './accounts';
 
 let placeholderContact: ConversationType;
 export const getPlaceholderContact = (): ConversationType => {
@@ -46,9 +52,12 @@ export const getPlaceholderContact = (): ConversationType => {
   }
 
   placeholderContact = {
+    acceptedMessageRequest: false,
     id: 'placeholder-contact',
     type: 'direct',
     title: window.i18n('unknownContact'),
+    isMe: false,
+    sharedGroupNames: [],
   };
   return placeholderContact;
 };
@@ -88,6 +97,18 @@ export const getConversationsByGroupId = createSelector(
   (state: ConversationsStateType): ConversationLookupType => {
     return state.conversationsByGroupId;
   }
+);
+
+const getAllConversations = createSelector(
+  getConversationLookup,
+  (lookup): Array<ConversationType> => Object.values(lookup)
+);
+
+export const getConversationsByTitleSelector = createSelector(
+  getAllConversations,
+  (conversations): ((title: string) => Array<ConversationType>) => (
+    title: string
+  ) => conversations.filter(conversation => conversation.title === title)
 );
 
 export const getSelectedConversationId = createSelector(
@@ -241,18 +262,22 @@ export const _getLeftPaneLists = (
   const max = values.length;
   for (let i = 0; i < max; i += 1) {
     let conversation = values[i];
-    if (conversation.activeAt) {
-      if (selectedConversation === conversation.id) {
-        conversation = {
-          ...conversation,
-          isSelected: true,
-        };
-      }
+    if (selectedConversation === conversation.id) {
+      conversation = {
+        ...conversation,
+        isSelected: true,
+      };
+    }
 
+    // We always show pinned conversations
+    if (conversation.isPinned) {
+      pinnedConversations.push(conversation);
+      continue;
+    }
+
+    if (conversation.activeAt) {
       if (conversation.isArchived) {
         archivedConversations.push(conversation);
-      } else if (conversation.isPinned) {
-        pinnedConversations.push(conversation);
       } else {
         conversations.push(conversation);
       }
@@ -323,80 +348,146 @@ export const getMe = createSelector(
   }
 );
 
-export const getComposerContactSearchTerm = createSelector(
+export const getComposerConversationSearchTerm = createSelector(
   getComposerState,
   (composer): string => {
     if (!composer) {
-      assert(false, 'getComposerContactSearchTerm: composer is not open');
+      assert(false, 'getComposerConversationSearchTerm: composer is not open');
       return '';
     }
     if (composer.step === ComposerStep.SetGroupMetadata) {
       assert(
         false,
-        'getComposerContactSearchTerm: composer does not have a search term'
+        'getComposerConversationSearchTerm: composer does not have a search term'
       );
       return '';
     }
-    return composer.contactSearchTerm;
+    return composer.searchTerm;
   }
 );
 
-/**
- * This returns contacts for the composer and group members, which isn't just your primary
- * system contacts. It may include false positives, which is better than missing contacts.
- *
- * Because it filters unregistered contacts and that's (partially) determined by the
- * current time, it's possible for this to return stale contacts that have unregistered
- * if no other conversations change. This should be a rare false positive.
- */
-export const getContacts = createSelector(
+function isTrusted(conversation: ConversationType): boolean {
+  if (conversation.type === 'group') {
+    return true;
+  }
+
+  return Boolean(
+    isInSystemContacts(conversation) ||
+      conversation.profileSharing ||
+      conversation.isMe
+  );
+}
+
+function hasDisplayInfo(conversation: ConversationType): boolean {
+  if (conversation.type === 'group') {
+    return Boolean(conversation.name);
+  }
+
+  return Boolean(
+    conversation.name ||
+      conversation.profileName ||
+      conversation.phoneNumber ||
+      conversation.isMe
+  );
+}
+
+function canComposeConversation(conversation: ConversationType): boolean {
+  return Boolean(
+    !conversation.isBlocked &&
+      !isConversationUnregistered(conversation) &&
+      hasDisplayInfo(conversation) &&
+      isTrusted(conversation)
+  );
+}
+
+export const getAllComposableConversations = createSelector(
   getConversationLookup,
   (conversationLookup: ConversationLookupType): Array<ConversationType> =>
     Object.values(conversationLookup).filter(
-      contact =>
-        contact.type === 'direct' &&
-        !contact.isMe &&
-        !contact.isBlocked &&
-        !isConversationUnregistered(contact) &&
-        (isString(contact.name) || contact.profileSharing)
+      conversation =>
+        !conversation.isBlocked &&
+        !conversation.isGroupV1AndDisabled &&
+        !isConversationUnregistered(conversation) &&
+        // All conversation should have a title except in weird cases where
+        // they don't, in that case we don't want to show these for Forwarding.
+        conversation.title &&
+        hasDisplayInfo(conversation)
     )
 );
 
-const getNormalizedComposerContactSearchTerm = createSelector(
-  getComposerContactSearchTerm,
-  (searchTerm: string): string => searchTerm.trim()
-);
-
-const getNoteToSelfTitle = createSelector(getIntl, (i18n: LocalizerType) =>
-  i18n('noteToSelf').toLowerCase()
-);
-
-export const getComposeContacts = createSelector(
-  getNormalizedComposerContactSearchTerm,
-  getContacts,
-  getMe,
-  getNoteToSelfTitle,
-  (
-    searchTerm: string,
-    contacts: Array<ConversationType>,
-    noteToSelf: ConversationType,
-    noteToSelfTitle: string
-  ): Array<ConversationType> => {
-    const result: Array<ConversationType> = filterAndSortContacts(
-      contacts,
-      searchTerm
-    );
-    if (!searchTerm || noteToSelfTitle.includes(searchTerm)) {
-      result.push(noteToSelf);
-    }
-    return result;
-  }
+/**
+ * getComposableContacts/getCandidateContactsForNewGroup both return contacts for the
+ * composer and group members, a different list from your primary system contacts.
+ * This list may include false positives, which is better than missing contacts.
+ *
+ * Note: the key difference between them:
+ *   getComposableContacts includes Note to Self
+ *   getCandidateContactsForNewGroup does not include Note to Self
+ *
+ * Because they filter unregistered contacts and that's (partially) determined by the
+ * current time, it's possible for them to return stale contacts that have unregistered
+ * if no other conversations change. This should be a rare false positive.
+ */
+export const getComposableContacts = createSelector(
+  getConversationLookup,
+  (conversationLookup: ConversationLookupType): Array<ConversationType> =>
+    Object.values(conversationLookup).filter(
+      conversation =>
+        conversation.type === 'direct' && canComposeConversation(conversation)
+    )
 );
 
 export const getCandidateContactsForNewGroup = createSelector(
-  getContacts,
-  getNormalizedComposerContactSearchTerm,
-  filterAndSortContacts
+  getConversationLookup,
+  (conversationLookup: ConversationLookupType): Array<ConversationType> =>
+    Object.values(conversationLookup).filter(
+      conversation =>
+        conversation.type === 'direct' &&
+        !conversation.isMe &&
+        canComposeConversation(conversation)
+    )
+);
+
+export const getComposableGroups = createSelector(
+  getConversationLookup,
+  (conversationLookup: ConversationLookupType): Array<ConversationType> =>
+    Object.values(conversationLookup).filter(
+      conversation =>
+        conversation.type === 'group' && canComposeConversation(conversation)
+    )
+);
+
+const getNormalizedComposerConversationSearchTerm = createSelector(
+  getComposerConversationSearchTerm,
+  (searchTerm: string): string => searchTerm.trim()
+);
+
+export const getFilteredComposeContacts = createSelector(
+  getNormalizedComposerConversationSearchTerm,
+  getComposableContacts,
+  (
+    searchTerm: string,
+    contacts: Array<ConversationType>
+  ): Array<ConversationType> => {
+    return filterAndSortConversationsByTitle(contacts, searchTerm);
+  }
+);
+
+export const getFilteredComposeGroups = createSelector(
+  getNormalizedComposerConversationSearchTerm,
+  getComposableGroups,
+  (
+    searchTerm: string,
+    groups: Array<ConversationType>
+  ): Array<ConversationType> => {
+    return filterAndSortConversationsByTitle(groups, searchTerm);
+  }
+);
+
+export const getFilteredCandidateContactsForNewGroup = createSelector(
+  getCandidateContactsForNewGroup,
+  getNormalizedComposerConversationSearchTerm,
+  filterAndSortConversationsByTitle
 );
 
 export const getCantAddContactForModal = createSelector(
@@ -428,6 +519,7 @@ const getGroupCreationComposerState = createSelector(
   ): {
     groupName: string;
     groupAvatar: undefined | ArrayBuffer;
+    groupExpireTimer: number;
     selectedConversationIds: Array<string>;
   } => {
     switch (composerState?.step) {
@@ -442,6 +534,7 @@ const getGroupCreationComposerState = createSelector(
         return {
           groupName: '',
           groupAvatar: undefined,
+          groupExpireTimer: 0,
           selectedConversationIds: [],
         };
     }
@@ -456,6 +549,11 @@ export const getComposeGroupAvatar = createSelector(
 export const getComposeGroupName = createSelector(
   getGroupCreationComposerState,
   (composerState): string => composerState.groupName
+);
+
+export const getComposeGroupExpireTimer = createSelector(
+  getGroupCreationComposerState,
+  (composerState): number => composerState.groupExpireTimer
 );
 
 export const getComposeSelectedContacts = createSelector(
@@ -522,13 +620,13 @@ export const getConversationSelector = createSelector(
         return selector(undefined);
       }
 
-      const onE164 = getOwn(byE164, id);
-      if (onE164) {
-        return selector(onE164);
-      }
       const onUuid = getOwn(byUuid, id.toLowerCase ? id.toLowerCase() : id);
       if (onUuid) {
         return selector(onUuid);
+      }
+      const onE164 = getOwn(byE164, id);
+      if (onE164) {
+        return selector(onE164);
       }
       const onGroupId = getOwn(byGroupId, id);
       if (onGroupId) {
@@ -548,66 +646,21 @@ export const getConversationSelector = createSelector(
   }
 );
 
-// For now we use a shim, as selector logic is still happening in the Backbone Model.
-// What needs to happen to pull that selector logic here?
-//   1) translate ~500 lines of selector logic into TypeScript
-//   2) other places still rely on that prop-gen code - need to put these under Roots:
-//     - quote compose
-//     - message details
-export function _messageSelector(
-  message: MessageType,
-  _ourNumber: string,
-  _regionCode: string,
-  interactionMode: 'mouse' | 'keyboard',
-  _getConversationById: GetConversationByIdType,
-  _callsByConversation: CallsByConversationType,
-  selectedMessageId?: string,
-  selectedMessageCounter?: number
-): TimelineItemType {
-  // Note: We don't use all of those parameters here, but the shim we call does.
-  //   We want to call this function again if any of those parameters change.
-  const props = getBubbleProps(message);
-
-  if (selectedMessageId === message.id) {
-    return {
-      ...props,
-      data: {
-        ...props.data,
-        interactionMode,
-        isSelected: true,
-        isSelectedCounter: selectedMessageCounter,
-      },
-    };
-  }
-
-  return {
-    ...props,
-    data: {
-      ...props.data,
-      interactionMode,
-    },
-  };
-}
+export const getConversationByIdSelector = createSelector(
+  getConversationLookup,
+  conversationLookup => (id: string): undefined | ConversationType =>
+    getOwn(conversationLookup, id)
+);
 
 // A little optimization to reset our selector cache whenever high-level application data
 //   changes: regionCode and userNumber.
-type CachedMessageSelectorType = (
-  message: MessageType,
-  ourNumber: string,
-  regionCode: string,
-  interactionMode: 'mouse' | 'keyboard',
-  getConversationById: GetConversationByIdType,
-  callsByConversation: CallsByConversationType,
-  selectedMessageId?: string,
-  selectedMessageCounter?: number
-) => TimelineItemType;
 export const getCachedSelectorForMessage = createSelector(
   getRegionCode,
   getUserNumber,
-  (): CachedMessageSelectorType => {
+  (): typeof getPropsForBubble => {
     // Note: memoizee will check all parameters provided, and only run our selector
     //   if any of them have changed.
-    return memoizee(_messageSelector, { max: 2000 });
+    return memoizee(getPropsForBubble, { max: 2000 });
   }
 );
 
@@ -618,18 +671,26 @@ export const getMessageSelector = createSelector(
   getSelectedMessage,
   getConversationSelector,
   getRegionCode,
+  getReadReceiptSetting,
   getUserNumber,
-  getInteractionMode,
-  getCallsByConversation,
+  getUserUuid,
+  getUserConversationId,
+  getCallSelector,
+  getActiveCall,
+  getAccountSelector,
   (
-    messageSelector: CachedMessageSelectorType,
+    messageSelector: typeof getPropsForBubble,
     messageLookup: MessageLookupType,
     selectedMessage: SelectedMessageType | undefined,
     conversationSelector: GetConversationByIdType,
     regionCode: string,
+    readReceiptSetting: boolean,
     ourNumber: string,
-    interactionMode: 'keyboard' | 'mouse',
-    callsByConversation: CallsByConversationType
+    ourUuid: string,
+    ourConversationId: string,
+    callSelector: CallSelectorType,
+    activeCall: undefined | CallStateType,
+    accountSelector: AccountSelectorType
   ): GetMessageByIdType => {
     return (id: string) => {
       const message = messageLookup[id];
@@ -639,13 +700,17 @@ export const getMessageSelector = createSelector(
 
       return messageSelector(
         message,
-        ourNumber,
-        regionCode,
-        interactionMode,
         conversationSelector,
-        callsByConversation,
+        ourConversationId,
+        ourNumber,
+        ourUuid,
+        regionCode,
+        readReceiptSetting,
         selectedMessage ? selectedMessage.id : undefined,
-        selectedMessage ? selectedMessage.counter : undefined
+        selectedMessage ? selectedMessage.counter : undefined,
+        callSelector,
+        activeCall,
+        accountSelector
       );
     };
   }
@@ -759,4 +824,103 @@ export const getInvitedContactsForNewlyCreatedGroup = createSelector(
       conversationLookup,
       invitedConversationIdsForNewlyCreatedGroup
     )
+);
+
+const getCachedConversationMemberColorsSelector = createSelector(
+  getConversationSelector,
+  (conversationSelector: GetConversationByIdType) => {
+    return memoizee(
+      (conversationId: string) => {
+        const contactNameColors: Map<string, ContactNameColorType> = new Map();
+        const { sortedGroupMembers = [] } = conversationSelector(
+          conversationId
+        );
+
+        [...sortedGroupMembers]
+          .sort((left, right) =>
+            String(left.uuid) > String(right.uuid) ? 1 : -1
+          )
+          .forEach((member, i) => {
+            contactNameColors.set(
+              member.id,
+              ContactNameColors[i % ContactNameColors.length]
+            );
+          });
+
+        return contactNameColors;
+      },
+      { max: 100 }
+    );
+  }
+);
+
+export const getContactNameColorSelector = createSelector(
+  getCachedConversationMemberColorsSelector,
+  conversationMemberColorsSelector => {
+    return (
+      conversationId: string,
+      contactId: string
+    ): ContactNameColorType => {
+      const contactNameColors = conversationMemberColorsSelector(
+        conversationId
+      );
+      const color = contactNameColors.get(contactId);
+      if (!color) {
+        assert(false, `No color generated for contact ${contactId}`);
+        return ContactNameColors[0];
+      }
+      return color;
+    };
+  }
+);
+
+export const getConversationsWithCustomColorSelector = createSelector(
+  getAllConversations,
+  conversations => {
+    return (colorId: string): Array<ConversationType> => {
+      return conversations.filter(
+        conversation => conversation.customColorId === colorId
+      );
+    };
+  }
+);
+
+export function isMissingRequiredProfileSharing(
+  conversation: ConversationType
+): boolean {
+  return Boolean(
+    !conversation.profileSharing &&
+      window.Signal.RemoteConfig.isEnabled('desktop.mandatoryProfileSharing') &&
+      conversation.messageCount &&
+      conversation.messageCount > 0
+  );
+}
+
+export const getGroupAdminsSelector = createSelector(
+  getConversationSelector,
+  (conversationSelector: GetConversationByIdType) => {
+    return (conversationId: string): Array<ConversationType> => {
+      const { groupId, groupVersion, memberships = [] } = conversationSelector(
+        conversationId
+      );
+
+      if (
+        !isGroupV2({
+          groupId,
+          groupVersion,
+        })
+      ) {
+        return [];
+      }
+
+      const admins: Array<ConversationType> = [];
+      memberships.forEach(membership => {
+        if (membership.isAdmin) {
+          const admin = conversationSelector(membership.conversationId);
+          admins.push(admin);
+        }
+      });
+      return admins;
+    };
+  }
 );

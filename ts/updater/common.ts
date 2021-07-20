@@ -39,9 +39,17 @@ const rimrafPromise = pify(rimraf);
 const { platform } = process;
 
 export const ACK_RENDER_TIMEOUT = 10000;
+export const GOT_CONNECT_TIMEOUT = 2 * 60 * 1000;
+export const GOT_LOOKUP_TIMEOUT = 2 * 60 * 1000;
+export const GOT_SOCKET_TIMEOUT = 2 * 60 * 1000;
+
+export type UpdaterInterface = {
+  force(): Promise<void>;
+};
 
 export async function checkForUpdates(
-  logger: LoggerType
+  logger: LoggerType,
+  forceUpdate = false
 ): Promise<{
   fileName: string;
   version: string;
@@ -55,8 +63,11 @@ export async function checkForUpdates(
     return null;
   }
 
-  if (isVersionNewer(version)) {
-    logger.info(`checkForUpdates: found newer version ${version}`);
+  if (forceUpdate || isVersionNewer(version)) {
+    logger.info(
+      `checkForUpdates: found newer version ${version} ` +
+        `forceUpdate=${forceUpdate}`
+    );
 
     return {
       fileName: getUpdateFileName(yaml),
@@ -329,6 +340,13 @@ function getGotOptions(): GotOptions<null> {
       'User-Agent': getUserAgent(packageJson.version),
     },
     useElectronNet: false,
+    timeout: {
+      connect: GOT_CONNECT_TIMEOUT,
+      lookup: GOT_LOOKUP_TIMEOUT,
+
+      // This timeout is reset whenever we get new data on the socket
+      socket: GOT_SOCKET_TIMEOUT,
+    },
   };
 }
 
@@ -364,7 +382,10 @@ export async function deleteTempDir(targetDir: string): Promise<void> {
   await rimrafPromise(targetDir);
 }
 
-export function getPrintableError(error: Error): Error | string {
+export function getPrintableError(error: Error | string): Error | string {
+  if (typeof error === 'string') {
+    return error;
+  }
   return error && error.stack ? error.stack : error;
 }
 
